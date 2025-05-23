@@ -45,27 +45,48 @@ const OutputWindow = ({ html, css, js }) => {
     if (!iframeRef.current) return;
     
     const iframe = iframeRef.current;
-    const doc = iframe.contentDocument || iframe.contentWindow.document;
+    const doc = iframe.contentDocument;
     
-    // Construct the HTML content by combining HTML, CSS, and JS
-    const content = `
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <style>${css}</style>
-        </head>
-        <body>
-          ${html}
-          <script>${js}</script>
-        </body>
-      </html>
-    `;
-    
-    // Write to the iframe
-    doc.open();
-    doc.write(content);
-    doc.close();
+    if (doc) {
+      doc.open();
+      doc.write(`
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <style>${css}</style>
+          </head>
+          <body>
+            ${html}
+            <script>${js}</script>
+          </body>
+        </html>
+      `);
+      doc.close();
+    } else {
+      // Fallback for when we can't access the document directly
+      const blob = new Blob([`
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <style>${css}</style>
+          </head>
+          <body>
+            ${html}
+            <script>${js}</script>
+          </body>
+        </html>
+      `], { type: 'text/html' });
+      iframe.src = URL.createObjectURL(blob);
+    }
   }, [html, css, js]);
+
+  useEffect(() => {
+    return () => {
+      if (iframeRef.current && iframeRef.current.src) {
+        URL.revokeObjectURL(iframeRef.current.src);
+      }
+    };
+  }, []);
   
   return (
     <div 

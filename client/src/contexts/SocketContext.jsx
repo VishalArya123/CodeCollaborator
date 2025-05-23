@@ -22,6 +22,7 @@ export const SocketProvider = ({ children }) => {
       reconnection: true,
       reconnectionAttempts: 5,
       reconnectionDelay: 1000,
+      debug: true  // Add this for debugging
     });
 
     // Set up event listeners

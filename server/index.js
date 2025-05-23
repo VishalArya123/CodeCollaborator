@@ -32,7 +32,8 @@ const io = new Server(server, {
     origin: process.env.CLIENT_URL || 'http://localhost:5173',
     methods: ['GET', 'POST'],
     credentials: true
-  }
+  },
+  debug: true  // Add this for debugging
 });
 
 // Initialize socket server

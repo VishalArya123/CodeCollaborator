@@ -145,6 +145,14 @@ const EditorPage = () => {
     URL.revokeObjectURL(jsURL);
   };
 
+  const leaveRoom = () => {
+    if (socket && connected) {
+      socket.emit('leave-room', { roomId, username });
+      socket.disconnect();
+    }
+    navigate('/');
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-screen">
@@ -166,6 +174,7 @@ const EditorPage = () => {
         toggleOutput={toggleOutput}
         copyRoomId={copyRoomId}
         exportCode={exportCode}
+        leaveRoom={leaveRoom}
       />
       
       <div className="flex flex-1 overflow-hidden">

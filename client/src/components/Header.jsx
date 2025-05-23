@@ -8,7 +8,8 @@ const Header = ({
   toggleSidebar, 
   toggleOutput, 
   copyRoomId, 
-  exportCode 
+  exportCode,
+  leaveRoom
 }) => {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   
@@ -70,6 +71,13 @@ const Header = ({
               className="px-3 py-1 rounded bg-blue-600 hover:bg-blue-700 text-sm"
             >
               Export Code
+            </button>
+
+            <button 
+              onClick={leaveRoom}
+              className="px-3 py-1 rounded bg-red-600 hover:bg-red-700 text-sm text-white"
+            >
+              Leave Room
             </button>
           </div>
           
@@ -145,6 +153,16 @@ const Header = ({
             className="w-full text-left px-3 py-2 rounded bg-blue-600 hover:bg-blue-700"
           >
             Export Code
+          </button>
+
+          <button 
+            onClick={() => {
+              leaveRoom();
+              setIsMenuOpen(false);
+            }}
+            className="w-full text-left px-3 py-2 rounded bg-red-600 hover:bg-red-700 text-white"
+          >
+            Leave Room
           </button>
         </div>
       )}

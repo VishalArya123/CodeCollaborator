@@ -39,6 +39,38 @@ const OutputWindow = ({ html, css, js }) => {
     startHeight.current = height;
     e.preventDefault(); // Prevent text selection during drag
   };
+
+  const handleRefresh = () => {
+    if (iframeRef.current) {
+      const iframe = iframeRef.current;
+      
+      // Create a new blob with the current code
+      const blob = new Blob([`
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <style>${css}</style>
+          </head>
+          <body>
+            ${html}
+            <script>${js}</script>
+          </body>
+        </html>
+      `], { type: 'text/html' });
+      
+      // Create a new URL and assign it to the iframe
+      const newUrl = URL.createObjectURL(blob);
+      iframe.src = newUrl;
+      
+      // Revoke the old URL if it exists
+      if (iframe.dataset.currentUrl) {
+        URL.revokeObjectURL(iframe.dataset.currentUrl);
+      }
+      
+      // Store the current URL for cleanup
+      iframe.dataset.currentUrl = newUrl;
+    }
+  };
   
   // Update iframe content when code changes
   useEffect(() => {
@@ -87,6 +119,14 @@ const OutputWindow = ({ html, css, js }) => {
       }
     };
   }, []);
+
+  useEffect(() => {
+    return () => {
+      if (iframeRef.current && iframeRef.current.dataset.currentUrl) {
+        URL.revokeObjectURL(iframeRef.current.dataset.currentUrl);
+      }
+    };
+  }, []);
   
   return (
     <div 
@@ -103,12 +143,7 @@ const OutputWindow = ({ html, css, js }) => {
       <div className="p-2 bg-gray-100 border-b border-gray-300 flex justify-between items-center">
         <h3 className="text-sm font-medium">Output Preview</h3>
         <button 
-          onClick={() => {
-            if (iframeRef.current) {
-              const iframe = iframeRef.current;
-              iframe.contentWindow.location.reload();
-            }
-          }}
+          onClick={handleRefresh}
           className="px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded hover:bg-blue-200"
         >
           Refresh

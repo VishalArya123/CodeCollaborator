@@ -21,15 +21,19 @@ const Chat = ({ roomId, username }) => {
 
   // Socket event listeners
   useEffect(() => {
-    if (!socket) return;
+    if (!socket || !roomId) return;
 
-    // Listen for new messages
-    socket.on('message-received', (message) => {
+    // Listen for chat messages (matches server event name)
+    const handleChatMessage = (message) => {
+      console.log('Received message:', message);
       setMessages(prev => [...prev, message]);
-    });
+    };
 
     // Listen for typing indicators
-    socket.on('user-typing', ({ username: typingUsername, isTyping: typing }) => {
+    const handleUserTyping = ({ userId, username: typingUsername, isTyping: typing }) => {
+      // Don't show typing indicator for current user
+      if (typingUsername === username) return;
+      
       setTypingUsers(prev => {
         if (typing) {
           return prev.includes(typingUsername) ? prev : [...prev, typingUsername];
@@ -37,30 +41,49 @@ const Chat = ({ roomId, username }) => {
           return prev.filter(user => user !== typingUsername);
         }
       });
-    });
-
-    return () => {
-      socket.off('message-received');
-      socket.off('user-typing');
     };
-  }, [socket]);
+
+    // Listen for room joined to get existing messages (if any)
+    const handleRoomJoined = ({ messages: existingMessages }) => {
+      if (existingMessages && existingMessages.length > 0) {
+        setMessages(existingMessages);
+      }
+    };
+
+    // Listen for user left to remove from typing users
+    const handleUserLeft = ({ userId }) => {
+      setTypingUsers(prev => prev.filter(user => user !== userId));
+    };
+
+    // Add event listeners
+    socket.on('chat-message', handleChatMessage);
+    socket.on('user-typing', handleUserTyping);
+    socket.on('room-joined', handleRoomJoined);
+    socket.on('user-left', handleUserLeft);
+
+    // Cleanup
+    return () => {
+      socket.off('chat-message', handleChatMessage);
+      socket.off('user-typing', handleUserTyping);
+      socket.off('room-joined', handleRoomJoined);
+      socket.off('user-left', handleUserLeft);
+    };
+  }, [socket, roomId, username]);
 
   // Handle sending messages
   const handleSendMessage = (e) => {
     e.preventDefault();
     
-    if (!newMessage.trim() || !socket) return;
+    if (!newMessage.trim() || !socket || !roomId) return;
 
-    const message = {
-      id: Date.now(),
-      username,
-      text: newMessage.trim(),
-      timestamp: new Date().toISOString(),
-      roomId
-    };
+    console.log('Sending message:', { roomId, message: newMessage.trim(), username });
 
-    // Emit message to server
-    socket.emit('send-message', message);
+    // Emit message to server (matches server expected format)
+    socket.emit('send-message', {
+      roomId,
+      message: newMessage.trim(),
+      username
+    });
     
     // Clear input
     setNewMessage('');
@@ -71,7 +94,7 @@ const Chat = ({ roomId, username }) => {
 
   // Handle typing indicators
   const handleTyping = () => {
-    if (!socket || isTyping) return;
+    if (!socket || isTyping || !roomId) return;
     
     setIsTyping(true);
     socket.emit('typing', { roomId, username, isTyping: true });
@@ -88,7 +111,7 @@ const Chat = ({ roomId, username }) => {
   };
 
   const handleStopTyping = () => {
-    if (!socket || !isTyping) return;
+    if (!socket || !isTyping || !roomId) return;
     
     setIsTyping(false);
     socket.emit('typing', { roomId, username, isTyping: false });
@@ -106,10 +129,15 @@ const Chat = ({ roomId, username }) => {
 
   // Format timestamp
   const formatTime = (timestamp) => {
-    return new Date(timestamp).toLocaleTimeString([], { 
-      hour: '2-digit', 
-      minute: '2-digit' 
-    });
+    try {
+      const date = new Date(timestamp);
+      return date.toLocaleTimeString([], { 
+        hour: '2-digit', 
+        minute: '2-digit' 
+      });
+    } catch (error) {
+      return '';
+    }
   };
 
   // Generate user color
@@ -122,10 +150,19 @@ const Chat = ({ roomId, username }) => {
     return `hsl(${hue}, 70%, 45%)`;
   };
 
+  // Cleanup timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+      }
+    };
+  }, []);
+
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full bg-white">
       {/* Chat Header */}
-      <div className="p-4 border-b border-gray-200">
+      <div className="p-4 border-b border-gray-200 bg-gray-50">
         <h3 className="text-lg font-medium text-gray-800">Team Chat</h3>
         <p className="text-sm text-gray-500">Stay connected with your team</p>
       </div>
@@ -144,19 +181,35 @@ const Chat = ({ roomId, username }) => {
           </div>
         ) : (
           messages.map((message, index) => {
-            const isCurrentUser = message.username === username;
-            const showUsername = index === 0 || messages[index - 1].username !== message.username;
+            // Handle system messages
+            if (message.sender === 'system') {
+              return (
+                <div key={message.id || index} className="text-center">
+                  <span className="text-xs text-gray-500 bg-gray-100 px-2 py-1 rounded-full">
+                    {message.message}
+                  </span>
+                </div>
+              );
+            }
+
+            const isCurrentUser = message.sender === username || message.username === username;
+            const showUsername = index === 0 || 
+              messages[index - 1]?.sender !== message.sender || 
+              messages[index - 1]?.username !== message.username;
+            
+            const messageText = message.message || message.text || '';
+            const messageSender = message.sender || message.username || 'Unknown';
             
             return (
-              <div key={message.id} className={`flex ${isCurrentUser ? 'justify-end' : 'justify-start'}`}>
+              <div key={message.id || index} className={`flex ${isCurrentUser ? 'justify-end' : 'justify-start'}`}>
                 <div className={`max-w-xs lg:max-w-md ${isCurrentUser ? 'order-2' : 'order-1'}`}>
                   {showUsername && !isCurrentUser && (
                     <div className="flex items-center mb-1">
                       <span 
                         className="text-xs font-medium"
-                        style={{ color: getUserColor(message.username) }}
+                        style={{ color: getUserColor(messageSender) }}
                       >
-                        {message.username}
+                        {messageSender}
                       </span>
                     </div>
                   )}
@@ -166,7 +219,7 @@ const Chat = ({ roomId, username }) => {
                       ? 'bg-blue-600 text-white' 
                       : 'bg-gray-100 text-gray-800'
                   }`}>
-                    <p className="text-sm">{message.text}</p>
+                    <p className="text-sm break-words">{messageText}</p>
                     <p className={`text-xs mt-1 ${
                       isCurrentUser ? 'text-blue-100' : 'text-gray-500'
                     }`}>
@@ -214,17 +267,25 @@ const Chat = ({ roomId, username }) => {
             placeholder="Type a message..."
             className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
             maxLength={500}
+            disabled={!socket || !roomId}
           />
           <button
             type="submit"
-            disabled={!newMessage.trim()}
-            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+            disabled={!newMessage.trim() || !socket || !roomId}
+            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
             </svg>
           </button>
         </form>
+        
+        {/* Debug info (remove in production) */}
+        {process.env.NODE_ENV === 'development' && (
+          <div className="mt-2 text-xs text-gray-400">
+            Socket: {socket ? 'Connected' : 'Disconnected'} | Room: {roomId || 'None'} | Messages: {messages.length}
+          </div>
+        )}
       </div>
     </div>
   );

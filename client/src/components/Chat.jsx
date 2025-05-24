@@ -18,10 +18,11 @@ const Chat = ({ roomId, username }) => {
   const hasJoinedRoom = useRef(false);
   const currentRoom = useRef(null);
   const currentUsername = useRef(null);
+  const isInitialized = useRef(false);
 
   // Get messages and typing users from context
   const messages = getRoomMessages(roomId);
-  const typingUsers = getRoomTypingUsers(roomId); // Fixed: should be roomId, not username
+  const typingUsers = getRoomTypingUsers(roomId);
 
   // Scroll to bottom when new messages arrive
   const scrollToBottom = () => {
@@ -32,9 +33,12 @@ const Chat = ({ roomId, username }) => {
     scrollToBottom();
   }, [messages]);
 
-  // Memoize join/leave functions to prevent recreating them on every render
+  // Stable join/leave functions that don't change on every render
   const handleJoinRoom = useCallback((roomId, username) => {
-    if (!socket || !connected || !roomId || !username) return;
+    if (!socket || !connected || !roomId || !username) {
+      console.log('Cannot join room - missing requirements:', { socket: !!socket, connected, roomId, username });
+      return;
+    }
 
     console.log('Joining room:', roomId, 'as:', username);
     joinRoom(roomId, username);
@@ -53,48 +57,71 @@ const Chat = ({ roomId, username }) => {
     currentUsername.current = null;
   }, [leaveRoom]);
 
-  // Join room when component mounts or roomId/username changes
+  // Single effect to handle room joining/leaving
   useEffect(() => {
-    // Only join if we have valid socket, connection, roomId, and username
-    if (!socket || !connected || !roomId || !username) return;
-
-    // If we're already in the same room with the same username, don't rejoin
-    if (hasJoinedRoom.current && 
-        currentRoom.current === roomId && 
-        currentUsername.current === username) {
+    // Don't do anything if we don't have the basic requirements
+    if (!socket || !roomId || !username) {
+      console.log('Missing basic requirements:', { socket: !!socket, roomId, username });
       return;
     }
 
-    // Leave current room if we're switching rooms
-    if (hasJoinedRoom.current && currentRoom.current !== roomId) {
+    // If we're not connected, don't try to join yet
+    if (!connected) {
+      console.log('Not connected, waiting...');
+      return;
+    }
+
+    // Check if we need to switch rooms
+    const needsRoomSwitch = currentRoom.current && currentRoom.current !== roomId;
+    const needsUsernameSwitch = currentUsername.current && currentUsername.current !== username;
+    const needsToJoin = !hasJoinedRoom.current;
+
+    // Leave current room if switching
+    if (needsRoomSwitch || needsUsernameSwitch) {
+      console.log('Switching rooms/username - leaving current room');
       handleLeaveRoom(currentRoom.current, currentUsername.current);
     }
 
-    // Join the new room
-    handleJoinRoom(roomId, username);
+    // Join room if needed
+    if (needsToJoin || needsRoomSwitch || needsUsernameSwitch) {
+      console.log('Joining room - reason:', { 
+        needsToJoin, 
+        needsRoomSwitch, 
+        needsUsernameSwitch 
+      });
+      handleJoinRoom(roomId, username);
+    }
 
-    // Cleanup function - leave room when component unmounts or dependencies change
+    // Mark as initialized
+    isInitialized.current = true;
+
+    // Cleanup function
     return () => {
-      if (hasJoinedRoom.current) {
+      // Only leave if this effect is being cleaned up due to unmounting
+      // or if roomId/username is actually changing
+      if (hasJoinedRoom.current && currentRoom.current && currentUsername.current) {
+        console.log('Component unmounting or dependencies changing - leaving room');
         handleLeaveRoom(currentRoom.current, currentUsername.current);
       }
     };
-  }, [socket, connected, roomId, username, handleJoinRoom, handleLeaveRoom]);
+  }, [socket, connected, roomId, username]); // Removed handleJoinRoom and handleLeaveRoom from deps
 
-  // Handle reconnection - rejoin room after reconnection
+  // Separate effect for reconnection handling
   useEffect(() => {
-    // Only rejoin if we were previously in a room and now we're reconnected
-    if (connected && 
-        roomId && 
-        username && 
-        currentRoom.current === roomId && 
-        currentUsername.current === username &&
-        !hasJoinedRoom.current) { // Only if we're not already joined
+    // Only handle reconnection if we were previously initialized and connected
+    if (!isInitialized.current || !connected || !roomId || !username) {
+      return;
+    }
+
+    // If we were in a room but are no longer joined (due to disconnection)
+    if (currentRoom.current === roomId && 
+        currentUsername.current === username && 
+        !hasJoinedRoom.current) {
       
       console.log('Reconnected - rejoining room:', roomId);
       handleJoinRoom(roomId, username);
     }
-  }, [connected, roomId, username, handleJoinRoom]);
+  }, [connected]); // Only depend on connected status
 
   // Handle sending messages
   const handleSendMessage = (e) => {
@@ -183,7 +210,7 @@ const Chat = ({ roomId, username }) => {
   const getUserColor = (username) => {
     let hash = 0;
     for (let i = 0; i < username.length; i++) {
-      hash = username.charCodei + ((hash << 5) - hash);
+      hash = username.charCodeAt(i) + ((hash << 5) - hash);
     }
     const hue = Math.abs(hash) % 360;
     return `hsl(${hue}, 70%, 45%)`;

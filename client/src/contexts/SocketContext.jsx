@@ -1,10 +1,8 @@
-import { createContext, useContext, useEffect, useState, useRef } from 'react';
+import { createContext, useContext, useEffect, useState, useRef, useCallback } from 'react';
 import { io } from 'socket.io-client';
 
-// Get the server URL from environment variables or use default
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:5001';
 
-// Create socket context
 const SocketContext = createContext();
 
 export const useSocket = () => {
@@ -14,34 +12,35 @@ export const useSocket = () => {
 export const SocketProvider = ({ children }) => {
   const [socket, setSocket] = useState(null);
   const [connected, setConnected] = useState(false);
-  const [messages, setMessages] = useState({}); // Store messages by roomId
+  const [connectionState, setConnectionState] = useState('disconnected');
+  const [messages, setMessages] = useState({});
   const [typingUsers, setTypingUsers] = useState({});
+  const [activeRoom, setActiveRoom] = useState(null);
   const reconnectAttempts = useRef(0);
+  const reconnectTimer = useRef(null);
   const maxReconnectAttempts = 5;
+  const usernameRef = useRef(null);
 
-  // Function to add message to specific room
-  const addMessage = (roomId, message) => {
+  // Stable reference for addMessage
+  const addMessage = useCallback((roomId, message) => {
     setMessages(prev => ({
       ...prev,
       [roomId]: [...(prev[roomId] || []), message]
     }));
-  };
+  }, []);
 
-  // Function to get messages for specific room
-  const getRoomMessages = (roomId) => {
+  const getRoomMessages = useCallback((roomId) => {
     return messages[roomId] || [];
-  };
+  }, [messages]);
 
-  // Function to set messages for specific room (for initial load)
-  const setRoomMessages = (roomId, roomMessages) => {
+  const setRoomMessages = useCallback((roomId, roomMessages) => {
     setMessages(prev => ({
       ...prev,
       [roomId]: roomMessages
     }));
-  };
+  }, []);
 
-  // Function to update typing users for specific room
-  const updateTypingUsers = (roomId, username, isTyping) => {
+  const updateTypingUsers = useCallback((roomId, username, isTyping) => {
     setTypingUsers(prev => {
       const roomTyping = prev[roomId] || [];
       if (isTyping) {
@@ -56,134 +55,135 @@ export const SocketProvider = ({ children }) => {
         };
       }
     });
-  };
+  }, []);
 
-  // Function to get typing users for specific room
-  const getRoomTypingUsers = (roomId) => {
+  const getRoomTypingUsers = useCallback((roomId) => {
     return typingUsers[roomId] || [];
-  };
+  }, [typingUsers]);
 
-  // Function to join a room and request message history
-  const joinRoom = (roomId, username) => {
-    if (socket && connected) {
-      console.log('Joining room:', roomId, 'as:', username);
-      socket.emit('join-room', { roomId, username });
-      
-      // Request message history for this room
-      socket.emit('get-room-messages', { roomId });
+  const joinRoom = useCallback((roomId, username) => {
+    if (!socket || !connected || activeRoom === roomId) return;
+    
+    usernameRef.current = username;
+    
+    if (activeRoom) {
+      leaveRoom(activeRoom, username);
     }
-  };
 
-  // Function to leave a room
-  const leaveRoom = (roomId, username) => {
-    if (socket && connected) {
-      console.log('Leaving room:', roomId);
-      socket.emit('leave-room', { roomId, username });
+    console.log('Joining room:', roomId, 'as:', username);
+    socket.emit('join-room', { roomId, username });
+    setActiveRoom(roomId);
+    socket.emit('get-room-messages', { roomId });
+  }, [socket, connected, activeRoom]);
+
+  const leaveRoom = useCallback((roomId, username) => {
+    if (!socket || !connected || !activeRoom) return;
+    
+    console.log('Leaving room:', roomId);
+    socket.emit('leave-room', { roomId, username });
+    setActiveRoom(null);
+  }, [socket, connected, activeRoom]);
+
+  // Handle reconnection to room
+  const handleReconnect = useCallback(() => {
+    if (activeRoom && usernameRef.current) {
+      console.log('Reconnecting to room:', activeRoom);
+      joinRoom(activeRoom, usernameRef.current);
     }
-  };
+  }, [activeRoom, joinRoom]);
 
   useEffect(() => {
-    // Initialize socket connection
     const socketInstance = io(SERVER_URL, {
       transports: ['websocket'],
       reconnection: true,
       reconnectionAttempts: maxReconnectAttempts,
       reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
       timeout: 20000,
-      forceNew: false, // Reuse existing connection if possible
+      forceNew: false,
     });
 
-    // Set up event listeners
     socketInstance.on('connect', () => {
       console.log('Connected to server with ID:', socketInstance.id);
       setConnected(true);
+      setConnectionState('connected');
       reconnectAttempts.current = 0;
+      handleReconnect();
     });
 
     socketInstance.on('disconnect', (reason) => {
       console.log('Disconnected from server:', reason);
       setConnected(false);
+      setConnectionState('disconnected');
     });
 
     socketInstance.on('reconnect', (attemptNumber) => {
       console.log('Reconnected after', attemptNumber, 'attempts');
-      setConnected(true);
-      reconnectAttempts.current = 0;
+      clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = setTimeout(() => {
+        setConnected(true);
+        setConnectionState('connected');
+        reconnectAttempts.current = 0;
+        handleReconnect();
+      }, 1000);
     });
 
-    socketInstance.on('reconnect_attempt', (attemptNumber) => {
+    socketInstance.on('reconnecting', (attemptNumber) => {
       console.log('Reconnection attempt', attemptNumber);
+      setConnectionState('reconnecting');
       reconnectAttempts.current = attemptNumber;
+    });
+
+    socketInstance.on('reconnect_failed', () => {
+      console.error('Reconnection failed');
+      setConnectionState('disconnected');
     });
 
     socketInstance.on('connect_error', (error) => {
       console.error('Socket connection error:', error);
       setConnected(false);
+      setConnectionState('disconnected');
     });
 
-    // Global message handler - stores messages in context
     socketInstance.on('chat-message', (message) => {
-      console.log('Received chat message in context:', message);
       if (message.roomId) {
         addMessage(message.roomId, message);
       }
     });
 
-    // Handle room joined event with message history
-    socketInstance.on('room-joined', ({ roomId, messages: roomMessages, users }) => {
-      console.log('Room joined:', roomId, 'with', roomMessages?.length || 0, 'messages');
-      if (roomMessages && roomMessages.length > 0) {
+    socketInstance.on('room-joined', ({ roomId, messages: roomMessages }) => {
+      if (roomMessages?.length > 0) {
         setRoomMessages(roomId, roomMessages);
       }
     });
 
-    // Handle message history response
     socketInstance.on('room-messages', ({ roomId, messages: roomMessages }) => {
-      console.log('Received room messages:', roomId, roomMessages?.length || 0);
       if (roomMessages) {
         setRoomMessages(roomId, roomMessages);
       }
     });
 
-    // Handle typing indicators globally
     socketInstance.on('user-typing', ({ roomId, username, isTyping }) => {
       updateTypingUsers(roomId, username, isTyping);
     });
 
-    // Handle user leaving
     socketInstance.on('user-left', ({ roomId, username }) => {
       updateTypingUsers(roomId, username, false);
     });
 
-    // Save socket instance
     setSocket(socketInstance);
 
-    // Handle page visibility change to maintain connection
-    const handleVisibilityChange = () => {
-      if (document.hidden) {
-        console.log('Page hidden - maintaining socket connection');
-      } else {
-        console.log('Page visible - ensuring socket connection');
-        if (!socketInstance.connected) {
-          socketInstance.connect();
-        }
-      }
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-
-    // Clean up on unmount
     return () => {
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      clearTimeout(reconnectTimer.current);
       socketInstance.disconnect();
     };
-  }, []);
+  }, [addMessage, setRoomMessages, updateTypingUsers, handleReconnect]);
 
-  // Context value
   const value = {
     socket,
     connected,
-    messages: messages, // All messages by room
+    connectionState,
+    messages,
     getRoomMessages,
     addMessage,
     setRoomMessages,
@@ -191,6 +191,7 @@ export const SocketProvider = ({ children }) => {
     updateTypingUsers,
     joinRoom,
     leaveRoom,
+    activeRoom,
     reconnectAttempts: reconnectAttempts.current,
     maxReconnectAttempts
   };

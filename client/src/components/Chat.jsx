@@ -25,8 +25,17 @@ const Chat = ({ roomId, username }) => {
 
     // Listen for chat messages (matches server event name)
     const handleChatMessage = (message) => {
-      console.log('Received message:', message);
-      setMessages(prev => [...prev, message]);
+      console.log('Received chat message:', message);
+      setMessages(prev => {
+        // Prevent duplicate messages
+        const isDuplicate = prev.some(msg => msg.id === message.id);
+        if (isDuplicate) {
+          console.log('Duplicate message detected, skipping');
+          return prev;
+        }
+        console.log('Adding new message to state');
+        return [...prev, message];
+      });
     };
 
     // Listen for typing indicators
@@ -74,16 +83,25 @@ const Chat = ({ roomId, username }) => {
   const handleSendMessage = (e) => {
     e.preventDefault();
     
-    if (!newMessage.trim() || !socket || !roomId) return;
+    if (!newMessage.trim() || !socket || !roomId) {
+      console.log('Message send blocked:', { 
+        hasMessage: !!newMessage.trim(), 
+        hasSocket: !!socket, 
+        hasRoomId: !!roomId 
+      });
+      return;
+    }
 
-    console.log('Sending message:', { roomId, message: newMessage.trim(), username });
-
-    // Emit message to server (matches server expected format)
-    socket.emit('send-message', {
+    const messageData = {
       roomId,
       message: newMessage.trim(),
       username
-    });
+    };
+
+    console.log('Sending message:', messageData);
+
+    // Emit message to server (matches server expected format)
+    socket.emit('send-message', messageData);
     
     // Clear input
     setNewMessage('');
@@ -280,12 +298,42 @@ const Chat = ({ roomId, username }) => {
           </button>
         </form>
         
-        {/* Debug info (remove in production) */}
-        {process.env.NODE_ENV === 'development' && (
-          <div className="mt-2 text-xs text-gray-400">
-            Socket: {socket ? 'Connected' : 'Disconnected'} | Room: {roomId || 'None'} | Messages: {messages.length}
-          </div>
-        )}
+        {/* Test button for debugging */}
+        <div className="mt-2 flex space-x-2">
+          <button
+            onClick={() => {
+              const testMessage = {
+                id: Date.now(),
+                sender: username,
+                message: 'Test message from client',
+                timestamp: new Date().toISOString()
+              };
+              console.log('Adding test message:', testMessage);
+              setMessages(prev => [...prev, testMessage]);
+            }}
+            className="px-2 py-1 text-xs bg-gray-500 text-white rounded"
+          >
+            Add Test Message
+          </button>
+          <button
+            onClick={() => {
+              console.log('Current messages:', messages);
+              console.log('Socket status:', socket?.connected);
+              console.log('Room ID:', roomId);
+            }}
+            className="px-2 py-1 text-xs bg-green-500 text-white rounded"
+          >
+            Debug Log
+          </button>
+        </div>
+        
+        {/* Debug info (always show for debugging) */}
+        <div className="mt-2 text-xs text-gray-400 font-mono">
+          Socket: {socket ? '✅ Connected' : '❌ Disconnected'} | 
+          Room: {roomId || 'None'} | 
+          Messages: {messages.length} |
+          Username: {username}
+        </div>
       </div>
     </div>
   );

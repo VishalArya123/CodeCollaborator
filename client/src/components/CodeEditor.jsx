@@ -9,6 +9,7 @@ const CodeEditor = ({ code, language, onChange, roomId, username, socket }) => {
   const editorRef = useRef(null);
   const [cursors, setCursors] = useState({});
   const debounceTimeout = useRef(null);
+  const [editorView, setEditorView] = useState(null);
   
   // Language extensions based on active tab
   const getLanguageExtension = () => {
@@ -29,7 +30,8 @@ const CodeEditor = ({ code, language, onChange, roomId, username, socket }) => {
     if (!socket) return;
     
     const { view } = viewUpdate;
-    const { line, ch } = view.state.selection.main.head;
+    const selection = view.state.selection.main;
+    const position = view.state.doc.lineAt(selection.head);
     
     // Clear any existing timeout
     if (debounceTimeout.current) {
@@ -43,8 +45,9 @@ const CodeEditor = ({ code, language, onChange, roomId, username, socket }) => {
         username,
         position: {
           language,
-          line,
-          ch
+          line: position.number,
+          ch: selection.head - position.from,
+          offset: selection.head
         }
       });
     }, 100); // 100ms debounce
@@ -54,7 +57,7 @@ const CodeEditor = ({ code, language, onChange, roomId, username, socket }) => {
   useEffect(() => {
     if (!socket) return;
     
-    socket.on('cursor-update', ({ userId, username, position }) => {
+    const handleCursorUpdate = ({ userId, username, position }) => {
       if (position.language !== language) return;
       
       setCursors((prev) => ({
@@ -64,51 +67,94 @@ const CodeEditor = ({ code, language, onChange, roomId, username, socket }) => {
           position
         }
       }));
-    });
+
+      // Clean up cursor after 5 seconds of inactivity
+      setTimeout(() => {
+        setCursors((prev) => {
+          const newCursors = { ...prev };
+          delete newCursors[userId];
+          return newCursors;
+        });
+      }, 5000);
+    };
+    
+    socket.on('cursor-update', handleCursorUpdate);
     
     return () => {
-      socket.off('cursor-update');
+      socket.off('cursor-update', handleCursorUpdate);
     };
   }, [socket, language]);
+
+  // Clean up cursors when users leave
+  useEffect(() => {
+    if (!socket) return;
+
+    const handleUserLeft = ({ userId }) => {
+      setCursors((prev) => {
+        const newCursors = { ...prev };
+        delete newCursors[userId];
+        return newCursors;
+      });
+    };
+
+    socket.on('user-left', handleUserLeft);
+
+    return () => {
+      socket.off('user-left', handleUserLeft);
+    };
+  }, [socket]);
+
+  // Store editor view reference
+  const handleEditorMount = (view) => {
+    setEditorView(view);
+  };
   
   // Render other users' cursors
   const renderCursors = () => {
-    if (!editorRef.current) return null;
+    if (!editorView) return null;
     
     const cursorElements = Object.entries(cursors).map(([userId, { username, position }]) => {
       if (position.language !== language) return null;
       
-      // Generate a unique color based on username
-      const color = stringToColor(username);
-      
-      // Get position in the editor
-      const coordsAtPos = editorRef.current.coordsAtPos(position.line, position.ch);
-      
-      if (!coordsAtPos) return null;
-      
-      return (
-        <div key={userId}>
-          <div 
-            className="user-cursor"
-            style={{
-              left: `${coordsAtPos.left}px`,
-              top: `${coordsAtPos.top}px`,
-              height: `${coordsAtPos.height}px`,
-              backgroundColor: color
-            }}
-          />
-          <div 
-            className="cursor-label"
-            style={{
-              left: `${coordsAtPos.left}px`,
-              top: `${coordsAtPos.top - 20}px`,
-              backgroundColor: color
-            }}
-          >
-            {username}
+      try {
+        // Generate a unique color based on username
+        const color = stringToColor(username);
+        
+        // Get position in the editor using CodeMirror 6 API
+        const pos = Math.min(position.offset || 0, editorView.state.doc.length);
+        const coords = editorView.coordsAtPos(pos);
+        
+        if (!coords) return null;
+        
+        return (
+          <div key={userId}>
+            <div 
+              className="absolute w-0.5 z-10 pointer-events-none"
+              style={{
+                left: `${coords.left}px`,
+                top: `${coords.top}px`,
+                height: `${coords.bottom - coords.top}px`,
+                backgroundColor: color,
+                transform: 'translateX(-1px)'
+              }}
+            />
+            <div 
+              className="absolute px-1 py-0.5 text-xs text-white rounded text-nowrap z-20 pointer-events-none"
+              style={{
+                left: `${coords.left}px`,
+                top: `${coords.top - 20}px`,
+                backgroundColor: color,
+                fontSize: '10px'
+              }}
+            >
+              {username}
+            </div>
           </div>
-        </div>
-      );
+        );
+      } catch (error) {
+        console.warn('Error rendering cursor:', error);
+        return null;
+      }
     });
     
     return cursorElements;
@@ -120,13 +166,20 @@ const CodeEditor = ({ code, language, onChange, roomId, username, socket }) => {
     for (let i = 0; i < str.length; i++) {
       hash = str.charCodeAt(i) + ((hash << 5) - hash);
     }
-    let color = '#';
-    for (let i = 0; i < 3; i++) {
-      const value = (hash >> (i * 8)) & 0xFF;
-      color += ('00' + value.toString(16)).substr(-2);
-    }
-    return color;
+    
+    // Generate a bright, distinct color
+    const hue = Math.abs(hash) % 360;
+    return `hsl(${hue}, 70%, 60%)`;
   };
+
+  // Clean up timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (debounceTimeout.current) {
+        clearTimeout(debounceTimeout.current);
+      }
+    };
+  }, []);
 
   return (
     <div className="flex-1 overflow-hidden relative">
@@ -138,6 +191,7 @@ const CodeEditor = ({ code, language, onChange, roomId, username, socket }) => {
         extensions={[getLanguageExtension()]}
         onChange={onChange}
         onUpdate={handleCursorActivity}
+        onCreateEditor={handleEditorMount}
         style={{ fontSize: '14px' }}
         basicSetup={{
           lineNumbers: true,
@@ -163,7 +217,9 @@ const CodeEditor = ({ code, language, onChange, roomId, username, socket }) => {
           lintKeymap: true
         }}
       />
-      {renderCursors()}
+      <div className="absolute inset-0 pointer-events-none">
+        {renderCursors()}
+      </div>
     </div>
   );
 };

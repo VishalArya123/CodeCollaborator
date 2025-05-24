@@ -2,13 +2,24 @@ import { useState, useEffect, useRef } from 'react';
 import { useSocket } from '../contexts/SocketContext';
 
 const Chat = ({ roomId, username }) => {
-  const { socket } = useSocket();
-  const [messages, setMessages] = useState([]);
+  const { 
+    socket, 
+    connected,
+    getRoomMessages, 
+    getRoomTypingUsers, 
+    joinRoom, 
+    leaveRoom 
+  } = useSocket();
+  
   const [newMessage, setNewMessage] = useState('');
   const [isTyping, setIsTyping] = useState(false);
-  const [typingUsers, setTypingUsers] = useState([]);
   const messagesEndRef = useRef(null);
   const typingTimeoutRef = useRef(null);
+  const hasJoinedRoom = useRef(false);
+
+  // Get messages and typing users from context
+  const messages = getRoomMessages(roomId);
+  const typingUsers = getRoomTypingUsers(username);
 
   // Scroll to bottom when new messages arrive
   const scrollToBottom = () => {
@@ -19,75 +30,42 @@ const Chat = ({ roomId, username }) => {
     scrollToBottom();
   }, [messages]);
 
-  // Socket event listeners
+  // Join room when component mounts or roomId changes
   useEffect(() => {
-    if (!socket || !roomId) return;
+    if (!socket || !connected || !roomId || !username) return;
 
-    // Listen for chat messages (matches server event name)
-    const handleChatMessage = (message) => {
-      console.log('Received chat message:', message);
-      setMessages(prev => {
-        // Prevent duplicate messages
-        const isDuplicate = prev.some(msg => msg.id === message.id);
-        if (isDuplicate) {
-          console.log('Duplicate message detected, skipping');
-          return prev;
-        }
-        console.log('Adding new message to state');
-        return [...prev, message];
-      });
-    };
+    console.log('Joining room:', roomId, 'as:', username);
+    joinRoom(roomId, username);
+    hasJoinedRoom.current = true;
 
-    // Listen for typing indicators
-    const handleUserTyping = ({ userId, username: typingUsername, isTyping: typing }) => {
-      // Don't show typing indicator for current user
-      if (typingUsername === username) return;
-      
-      setTypingUsers(prev => {
-        if (typing) {
-          return prev.includes(typingUsername) ? prev : [...prev, typingUsername];
-        } else {
-          return prev.filter(user => user !== typingUsername);
-        }
-      });
-    };
-
-    // Listen for room joined to get existing messages (if any)
-    const handleRoomJoined = ({ messages: existingMessages }) => {
-      if (existingMessages && existingMessages.length > 0) {
-        setMessages(existingMessages);
+    // Leave room when component unmounts or roomId changes
+    return () => {
+      if (hasJoinedRoom.current) {
+        console.log('Leaving room:', roomId);
+        leaveRoom(roomId, username);
+        hasJoinedRoom.current = false;
       }
     };
+  }, [socket, connected, roomId, username, joinRoom, leaveRoom]);
 
-    // Listen for user left to remove from typing users
-    const handleUserLeft = ({ userId }) => {
-      setTypingUsers(prev => prev.filter(user => user !== userId));
-    };
-
-    // Add event listeners
-    socket.on('chat-message', handleChatMessage);
-    socket.on('user-typing', handleUserTyping);
-    socket.on('room-joined', handleRoomJoined);
-    socket.on('user-left', handleUserLeft);
-
-    // Cleanup
-    return () => {
-      socket.off('chat-message', handleChatMessage);
-      socket.off('user-typing', handleUserTyping);
-      socket.off('room-joined', handleRoomJoined);
-      socket.off('user-left', handleUserLeft);
-    };
-  }, [socket, roomId, username]);
+  // Rejoin room after reconnection
+  useEffect(() => {
+    if (connected && roomId && username && hasJoinedRoom.current) {
+      console.log('Reconnected - rejoining room:', roomId);
+      joinRoom(roomId, username);
+    }
+  }, [connected, roomId, username, joinRoom]);
 
   // Handle sending messages
   const handleSendMessage = (e) => {
     e.preventDefault();
     
-    if (!newMessage.trim() || !socket || !roomId) {
+    if (!newMessage.trim() || !socket || !roomId || !connected) {
       console.log('Message send blocked:', { 
         hasMessage: !!newMessage.trim(), 
         hasSocket: !!socket, 
-        hasRoomId: !!roomId 
+        hasRoomId: !!roomId,
+        connected: connected
       });
       return;
     }
@@ -95,12 +73,13 @@ const Chat = ({ roomId, username }) => {
     const messageData = {
       roomId,
       message: newMessage.trim(),
-      username
+      username,
+      timestamp: new Date().toISOString()
     };
 
     console.log('Sending message:', messageData);
 
-    // Emit message to server (matches server expected format)
+    // Emit message to server
     socket.emit('send-message', messageData);
     
     // Clear input
@@ -112,7 +91,7 @@ const Chat = ({ roomId, username }) => {
 
   // Handle typing indicators
   const handleTyping = () => {
-    if (!socket || isTyping || !roomId) return;
+    if (!socket || isTyping || !roomId || !connected) return;
     
     setIsTyping(true);
     socket.emit('typing', { roomId, username, isTyping: true });
@@ -142,7 +121,9 @@ const Chat = ({ roomId, username }) => {
   // Handle input change
   const handleInputChange = (e) => {
     setNewMessage(e.target.value);
-    handleTyping();
+    if (connected) {
+      handleTyping();
+    }
   };
 
   // Format timestamp
@@ -181,8 +162,18 @@ const Chat = ({ roomId, username }) => {
     <div className="flex flex-col h-full bg-white">
       {/* Chat Header */}
       <div className="p-4 border-b border-gray-200 bg-gray-50">
-        <h3 className="text-lg font-medium text-gray-800">Team Chat</h3>
-        <p className="text-sm text-gray-500">Stay connected with your team</p>
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-lg font-medium text-gray-800">Team Chat</h3>
+            <p className="text-sm text-gray-500">Stay connected with your team</p>
+          </div>
+          <div className="flex items-center space-x-2">
+            <div className={`w-2 h-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`}></div>
+            <span className="text-xs text-gray-500">
+              {connected ? 'Connected' : 'Disconnected'}
+            </span>
+          </div>
+        </div>
       </div>
 
       {/* Messages Container */}
@@ -282,14 +273,14 @@ const Chat = ({ roomId, username }) => {
             value={newMessage}
             onChange={handleInputChange}
             onBlur={handleStopTyping}
-            placeholder="Type a message..."
-            className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+            placeholder={connected ? "Type a message..." : "Connecting..."}
+            className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm disabled:bg-gray-100"
             maxLength={500}
-            disabled={!socket || !roomId}
+            disabled={!socket || !roomId || !connected}
           />
           <button
             type="submit"
-            disabled={!newMessage.trim() || !socket || !roomId}
+            disabled={!newMessage.trim() || !socket || !roomId || !connected}
             className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -298,38 +289,18 @@ const Chat = ({ roomId, username }) => {
           </button>
         </form>
         
-        {/* Test button for debugging */}
-        <div className="mt-2 flex space-x-2">
-          <button
-            onClick={() => {
-              const testMessage = {
-                id: Date.now(),
-                sender: username,
-                message: 'Test message from client',
-                timestamp: new Date().toISOString()
-              };
-              console.log('Adding test message:', testMessage);
-              setMessages(prev => [...prev, testMessage]);
-            }}
-            className="px-2 py-1 text-xs bg-gray-500 text-white rounded"
-          >
-            Add Test Message
-          </button>
-          <button
-            onClick={() => {
-              console.log('Current messages:', messages);
-              console.log('Socket status:', socket?.connected);
-              console.log('Room ID:', roomId);
-            }}
-            className="px-2 py-1 text-xs bg-green-500 text-white rounded"
-          >
-            Debug Log
-          </button>
-        </div>
+        {/* Connection Status */}
+        {!connected && (
+          <div className="mt-2 text-center">
+            <span className="text-xs text-red-500 bg-red-50 px-2 py-1 rounded">
+              Disconnected - Trying to reconnect...
+            </span>
+          </div>
+        )}
         
-        {/* Debug info (always show for debugging) */}
+        {/* Debug info (remove in production) */}
         <div className="mt-2 text-xs text-gray-400 font-mono">
-          Socket: {socket ? '✅ Connected' : '❌ Disconnected'} | 
+          Socket: {connected ? '✅ Connected' : '❌ Disconnected'} | 
           Room: {roomId || 'None'} | 
           Messages: {messages.length} |
           Username: {username}

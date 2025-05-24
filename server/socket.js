@@ -11,6 +11,8 @@ function setupSocketServer(io) {
 
     // Join a room
     socket.on('join-room', ({ roomId, username }) => {
+      console.log(`User ${username} (${socket.id}) joining room: ${roomId}`);
+      
       // Leave any existing rooms first
       socket.rooms.forEach(room => {
         if (room !== socket.id) {
@@ -24,12 +26,14 @@ function setupSocketServer(io) {
       if (!rooms.has(roomId)) {
         rooms.set(roomId, {
           users: [],
+          messages: [], // Store chat messages
           code: {
             html: '',
             css: '',
             js: ''
           },
-          activeUsers: 0
+          activeUsers: 0,
+          createdAt: new Date()
         });
       }
 
@@ -49,27 +53,59 @@ function setupSocketServer(io) {
         roomData.users.push(user);
         roomData.activeUsers += 1;
 
+        // Create join message
+        const joinMessage = {
+          id: `${Date.now()}-${socket.id}`,
+          sender: 'system',
+          message: `${username} has joined the room`,
+          timestamp: new Date().toISOString(),
+          roomId
+        };
+
+        // Store the message
+        roomData.messages.push(joinMessage);
+
         // Notify other users about the new user
         socket.to(roomId).emit('user-joined', {
           user,
           users: roomData.users
         });
 
-        // Send system message
-        io.to(roomId).emit('chat-message', {
-          id: Date.now(),
-          sender: 'system',
-          message: `${username} has joined the room`,
-          timestamp: new Date()
-        });
+        // Send system message to all users in room
+        io.to(roomId).emit('chat-message', joinMessage);
+      } else {
+        // User is reconnecting, update their socket ID
+        roomData.users[existingUserIndex].id = socket.id;
+        roomData.users[existingUserIndex].reconnectedAt = new Date();
       }
 
       // Emit welcome message to the user (always send current state)
       socket.emit('room-joined', {
         roomId,
         users: roomData.users,
+        messages: roomData.messages, // Send message history
         code: roomData.code
       });
+
+      console.log(`Room ${roomId} now has ${roomData.users.length} users`);
+    });
+
+    // Handle request for room messages (for reconnection/tab switching)
+    socket.on('get-room-messages', ({ roomId }) => {
+      console.log(`User ${socket.id} requesting messages for room: ${roomId}`);
+      
+      if (rooms.has(roomId)) {
+        const roomData = rooms.get(roomId);
+        socket.emit('room-messages', {
+          roomId,
+          messages: roomData.messages
+        });
+      } else {
+        socket.emit('room-messages', {
+          roomId,
+          messages: []
+        });
+      }
     });
 
     // Handle code changes
@@ -96,15 +132,38 @@ function setupSocketServer(io) {
     });
 
     // Handle chat messages
-    socket.on('send-message', ({ roomId, message, username }) => {
+    socket.on('send-message', ({ roomId, message, username, timestamp }) => {
+      console.log(`Message from ${username} in room ${roomId}: ${message}`);
+      
+      if (!rooms.has(roomId)) {
+        console.log(`Room ${roomId} not found, cannot send message`);
+        return;
+      }
+
+      const roomData = rooms.get(roomId);
+      
+      // Create message object
       const messageData = {
-        id: Date.now(),
+        id: `${Date.now()}-${socket.id}`,
         sender: username,
+        username: username, // Add both for compatibility
         userId: socket.id,
-        message,
-        timestamp: new Date()
+        message: message.trim(),
+        timestamp: timestamp || new Date().toISOString(),
+        roomId
       };
 
+      // Store message in room
+      roomData.messages.push(messageData);
+
+      // Keep only last 1000 messages per room to prevent memory issues
+      if (roomData.messages.length > 1000) {
+        roomData.messages = roomData.messages.slice(-1000);
+      }
+
+      console.log(`Broadcasting message to room ${roomId}, room has ${roomData.users.length} users`);
+      
+      // Broadcast to ALL users in the room (including sender for confirmation)
       io.to(roomId).emit('chat-message', messageData);
     });
 
@@ -119,12 +178,13 @@ function setupSocketServer(io) {
 
     // Handle explicit room leaving
     socket.on('leave-room', ({ roomId, username }) => {
+      console.log(`User ${username} explicitly leaving room: ${roomId}`);
       handleUserLeaving(socket, roomId, username, io);
     });
 
     // Handle disconnection
-    socket.on('disconnect', () => {
-      console.log(`User disconnected: ${socket.id}`);
+    socket.on('disconnect', (reason) => {
+      console.log(`User disconnected: ${socket.id}, reason: ${reason}`);
 
       // Find which room the user was in and handle leaving
       for (const [roomId, roomData] of rooms.entries()) {
@@ -132,7 +192,25 @@ function setupSocketServer(io) {
 
         if (userIndex !== -1) {
           const username = roomData.users[userIndex].username;
-          handleUserLeaving(socket, roomId, username, io);
+          
+          // For temporary disconnections (like tab switching), don't immediately remove user
+          if (reason === 'transport close' || reason === 'ping timeout') {
+            console.log(`Temporary disconnect for ${username}, keeping in room for potential reconnection`);
+            // Mark user as temporarily disconnected but don't remove immediately
+            roomData.users[userIndex].disconnectedAt = new Date();
+            
+            // Set a timeout to remove user if they don't reconnect within 30 seconds
+            setTimeout(() => {
+              const currentUser = roomData.users.find(user => user.id === socket.id);
+              if (currentUser && currentUser.disconnectedAt) {
+                console.log(`User ${username} did not reconnect, removing from room`);
+                handleUserLeaving(socket, roomId, username, io);
+              }
+            }, 30000); // 30 second grace period
+          } else {
+            // Immediate disconnect for other reasons
+            handleUserLeaving(socket, roomId, username, io);
+          }
           break;
         }
       }
@@ -153,28 +231,91 @@ function setupSocketServer(io) {
         // Leave the socket room
         socket.leave(roomId);
 
+        // Create leave message
+        const leaveMessage = {
+          id: `${Date.now()}-${socket.id}`,
+          sender: 'system',
+          message: `${username} has left the room`,
+          timestamp: new Date().toISOString(),
+          roomId
+        };
+
+        // Store the message
+        roomData.messages.push(leaveMessage);
+
         // Notify other users
         socket.to(roomId).emit('user-left', {
           userId: socket.id,
+          username,
           users: roomData.users
         });
 
         // Send system message
-        io.to(roomId).emit('chat-message', {
-          id: Date.now(),
-          sender: 'system',
-          message: `${username} has left the room`,
-          timestamp: new Date()
-        });
+        io.to(roomId).emit('chat-message', leaveMessage);
 
-        // Clean up empty rooms
+        console.log(`User ${username} left room ${roomId}, ${roomData.users.length} users remaining`);
+
+        // Clean up empty rooms after a delay to allow for reconnections
         if (roomData.users.length === 0) {
-          rooms.delete(roomId);
-          console.log(`Room ${roomId} has been deleted (no users)`);
+          setTimeout(() => {
+            if (rooms.has(roomId) && rooms.get(roomId).users.length === 0) {
+              rooms.delete(roomId);
+              console.log(`Room ${roomId} has been deleted (no users)`);
+            }
+          }, 60000); // Wait 1 minute before deleting empty room
         }
       }
     }
   }
+
+  // Optional: Add a cleanup function to run periodically
+  const cleanupInterval = setInterval(() => {
+    let cleaned = 0;
+    for (const [roomId, roomData] of rooms.entries()) {
+      // Remove rooms that have been empty for more than 1 hour
+      if (roomData.users.length === 0 && 
+          (Date.now() - roomData.createdAt.getTime()) > 3600000) {
+        rooms.delete(roomId);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      console.log(`Cleaned up ${cleaned} empty rooms`);
+    }
+  }, 300000); // Run every 5 minutes
+
+  // Clean up interval on server shutdown
+  process.on('SIGTERM', () => {
+    clearInterval(cleanupInterval);
+  });
+
+  process.on('SIGINT', () => {
+    clearInterval(cleanupInterval);
+  });
 }
 
-module.exports = { setupSocketServer };
+// Optional: Function to get room statistics (for debugging/monitoring)
+function getRoomStats() {
+  const stats = {
+    totalRooms: rooms.size,
+    totalUsers: 0,
+    rooms: []
+  };
+
+  for (const [roomId, roomData] of rooms.entries()) {
+    stats.totalUsers += roomData.users.length;
+    stats.rooms.push({
+      roomId,
+      userCount: roomData.users.length,
+      messageCount: roomData.messages.length,
+      createdAt: roomData.createdAt
+    });
+  }
+
+  return stats;
+}
+
+module.exports = { 
+  setupSocketServer,
+  getRoomStats // Export for potential monitoring endpoints
+};

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useSocket } from '../contexts/SocketContext';
 
 const Chat = ({ roomId, username }) => {
@@ -16,10 +16,12 @@ const Chat = ({ roomId, username }) => {
   const messagesEndRef = useRef(null);
   const typingTimeoutRef = useRef(null);
   const hasJoinedRoom = useRef(false);
+  const currentRoom = useRef(null);
+  const currentUsername = useRef(null);
 
   // Get messages and typing users from context
   const messages = getRoomMessages(roomId);
-  const typingUsers = getRoomTypingUsers(username);
+  const typingUsers = getRoomTypingUsers(roomId); // Fixed: should be roomId, not username
 
   // Scroll to bottom when new messages arrive
   const scrollToBottom = () => {
@@ -30,31 +32,69 @@ const Chat = ({ roomId, username }) => {
     scrollToBottom();
   }, [messages]);
 
-  // Join room when component mounts or roomId changes
-  useEffect(() => {
+  // Memoize join/leave functions to prevent recreating them on every render
+  const handleJoinRoom = useCallback((roomId, username) => {
     if (!socket || !connected || !roomId || !username) return;
 
     console.log('Joining room:', roomId, 'as:', username);
     joinRoom(roomId, username);
     hasJoinedRoom.current = true;
+    currentRoom.current = roomId;
+    currentUsername.current = username;
+  }, [socket, connected, joinRoom]);
 
-    // Leave room when component unmounts or roomId changes
+  const handleLeaveRoom = useCallback((roomId, username) => {
+    if (!hasJoinedRoom.current || !roomId || !username) return;
+
+    console.log('Leaving room:', roomId);
+    leaveRoom(roomId, username);
+    hasJoinedRoom.current = false;
+    currentRoom.current = null;
+    currentUsername.current = null;
+  }, [leaveRoom]);
+
+  // Join room when component mounts or roomId/username changes
+  useEffect(() => {
+    // Only join if we have valid socket, connection, roomId, and username
+    if (!socket || !connected || !roomId || !username) return;
+
+    // If we're already in the same room with the same username, don't rejoin
+    if (hasJoinedRoom.current && 
+        currentRoom.current === roomId && 
+        currentUsername.current === username) {
+      return;
+    }
+
+    // Leave current room if we're switching rooms
+    if (hasJoinedRoom.current && currentRoom.current !== roomId) {
+      handleLeaveRoom(currentRoom.current, currentUsername.current);
+    }
+
+    // Join the new room
+    handleJoinRoom(roomId, username);
+
+    // Cleanup function - leave room when component unmounts or dependencies change
     return () => {
       if (hasJoinedRoom.current) {
-        console.log('Leaving room:', roomId);
-        leaveRoom(roomId, username);
-        hasJoinedRoom.current = false;
+        handleLeaveRoom(currentRoom.current, currentUsername.current);
       }
     };
-  }, [socket, connected, roomId, username, joinRoom, leaveRoom]);
+  }, [socket, connected, roomId, username, handleJoinRoom, handleLeaveRoom]);
 
-  // Rejoin room after reconnection
+  // Handle reconnection - rejoin room after reconnection
   useEffect(() => {
-    if (connected && roomId && username && hasJoinedRoom.current) {
+    // Only rejoin if we were previously in a room and now we're reconnected
+    if (connected && 
+        roomId && 
+        username && 
+        currentRoom.current === roomId && 
+        currentUsername.current === username &&
+        !hasJoinedRoom.current) { // Only if we're not already joined
+      
       console.log('Reconnected - rejoining room:', roomId);
-      joinRoom(roomId, username);
+      handleJoinRoom(roomId, username);
     }
-  }, [connected, roomId, username, joinRoom]);
+  }, [connected, roomId, username, handleJoinRoom]);
 
   // Handle sending messages
   const handleSendMessage = (e) => {
@@ -90,7 +130,7 @@ const Chat = ({ roomId, username }) => {
   };
 
   // Handle typing indicators
-  const handleTyping = () => {
+  const handleTyping = useCallback(() => {
     if (!socket || isTyping || !roomId || !connected) return;
     
     setIsTyping(true);
@@ -105,9 +145,9 @@ const Chat = ({ roomId, username }) => {
     typingTimeoutRef.current = setTimeout(() => {
       handleStopTyping();
     }, 2000);
-  };
+  }, [socket, isTyping, roomId, connected, username]);
 
-  const handleStopTyping = () => {
+  const handleStopTyping = useCallback(() => {
     if (!socket || !isTyping || !roomId) return;
     
     setIsTyping(false);
@@ -116,7 +156,7 @@ const Chat = ({ roomId, username }) => {
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current);
     }
-  };
+  }, [socket, isTyping, roomId, username]);
 
   // Handle input change
   const handleInputChange = (e) => {
@@ -143,7 +183,7 @@ const Chat = ({ roomId, username }) => {
   const getUserColor = (username) => {
     let hash = 0;
     for (let i = 0; i < username.length; i++) {
-      hash = username.charCodeAt(i) + ((hash << 5) - hash);
+      hash = username.charCodei + ((hash << 5) - hash);
     }
     const hue = Math.abs(hash) % 360;
     return `hsl(${hue}, 70%, 45%)`;
@@ -303,7 +343,8 @@ const Chat = ({ roomId, username }) => {
           Socket: {connected ? '✅ Connected' : '❌ Disconnected'} | 
           Room: {roomId || 'None'} | 
           Messages: {messages.length} |
-          Username: {username}
+          Username: {username} |
+          Joined: {hasJoinedRoom.current ? '✅' : '❌'}
         </div>
       </div>
     </div>

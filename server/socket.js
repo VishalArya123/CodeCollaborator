@@ -27,6 +27,7 @@ function setupSocketServer(io) {
         rooms.set(roomId, {
           users: [],
           messages: [], // Store chat messages
+          files: [], // Store uploaded files
           code: {
             html: '',
             css: '',
@@ -84,6 +85,7 @@ function setupSocketServer(io) {
         roomId,
         users: roomData.users,
         messages: roomData.messages, // Send message history
+        files: roomData.files, // Send files
         code: roomData.code
       });
 
@@ -105,6 +107,101 @@ function setupSocketServer(io) {
           roomId,
           messages: []
         });
+      }
+    });
+
+    // Handle request for room files
+    socket.on('get-room-files', ({ roomId }) => {
+      console.log(`User ${socket.id} requesting files for room: ${roomId}`);
+      
+      if (rooms.has(roomId)) {
+        const roomData = rooms.get(roomId);
+        socket.emit('files-updated', roomData.files);
+      } else {
+        socket.emit('files-updated', []);
+      }
+    });
+
+    // Handle file upload
+    socket.on('upload-files', ({ roomId, files }) => {
+      console.log(`User ${socket.id} uploading ${files.length} files to room: ${roomId}`);
+      
+      if (!rooms.has(roomId)) {
+        console.log(`Room ${roomId} not found, cannot upload files`);
+        return;
+      }
+
+      const roomData = rooms.get(roomId);
+      
+      // Add files to room data
+      files.forEach(file => {
+        // Check if file with same name already exists
+        const existingFileIndex = roomData.files.findIndex(f => f.name === file.name);
+        if (existingFileIndex !== -1) {
+          // Replace existing file
+          roomData.files[existingFileIndex] = file;
+        } else {
+          // Add new file
+          roomData.files.push(file);
+        }
+      });
+
+      // Limit total files per room (optional, to prevent memory issues)
+      if (roomData.files.length > 100) {
+        roomData.files = roomData.files.slice(-100); // Keep only latest 100 files
+      }
+
+      // Broadcast updated files list to all users in room
+      io.to(roomId).emit('files-updated', roomData.files);
+
+      // Send system message about file upload
+      const fileNames = files.map(f => f.name).join(', ');
+      const uploadMessage = {
+        id: `${Date.now()}-${socket.id}`,
+        sender: 'system',
+        message: `${files[0].uploadedBy} uploaded ${files.length} file(s): ${fileNames}`,
+        timestamp: new Date().toISOString(),
+        roomId
+      };
+
+      roomData.messages.push(uploadMessage);
+      io.to(roomId).emit('chat-message', uploadMessage);
+
+      console.log(`Files uploaded to room ${roomId}, total files: ${roomData.files.length}`);
+    });
+
+    // Handle file deletion
+    socket.on('delete-file', ({ roomId, fileId }) => {
+      console.log(`User ${socket.id} deleting file ${fileId} from room: ${roomId}`);
+      
+      if (!rooms.has(roomId)) {
+        console.log(`Room ${roomId} not found, cannot delete file`);
+        return;
+      }
+
+      const roomData = rooms.get(roomId);
+      const fileIndex = roomData.files.findIndex(f => f.id === fileId);
+      
+      if (fileIndex !== -1) {
+        const deletedFile = roomData.files[fileIndex];
+        roomData.files.splice(fileIndex, 1);
+
+        // Broadcast updated files list to all users in room
+        io.to(roomId).emit('files-updated', roomData.files);
+
+        // Send system message about file deletion
+        const deleteMessage = {
+          id: `${Date.now()}-${socket.id}`,
+          sender: 'system',
+          message: `File "${deletedFile.name}" was deleted`,
+          timestamp: new Date().toISOString(),
+          roomId
+        };
+
+        roomData.messages.push(deleteMessage);
+        io.to(roomId).emit('chat-message', deleteMessage);
+
+        console.log(`File ${deletedFile.name} deleted from room ${roomId}`);
       }
     });
 
@@ -308,6 +405,7 @@ function getRoomStats() {
       roomId,
       userCount: roomData.users.length,
       messageCount: roomData.messages.length,
+      fileCount: roomData.files.length,
       createdAt: roomData.createdAt
     });
   }

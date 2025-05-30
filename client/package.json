@@ -17,6 +17,7 @@
     "@uiw/codemirror-theme-vscode": "^4.23.12",
     "@uiw/react-codemirror": "^4.23.12",
     "eslint-plugin-react": "^7.37.5",
+    "jszip": "^3.10.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-router-dom": "^7.6.0",

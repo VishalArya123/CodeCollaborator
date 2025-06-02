@@ -6,6 +6,9 @@ const rooms = new Map();
  * @param {Object} io - Socket.io server instance
  */
 function setupSocketServer(io) {
+  // Configure Socket.IO server with larger maxHttpBufferSize (50MB)
+  io.engine.opts.maxHttpBufferSize = 50e6; // 50MB
+
   io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
@@ -128,46 +131,52 @@ function setupSocketServer(io) {
       
       if (!rooms.has(roomId)) {
         console.log(`Room ${roomId} not found, cannot upload files`);
+        socket.emit('upload-error', { message: 'Room not found' });
         return;
       }
 
-      const roomData = rooms.get(roomId);
-      
-      // Add files to room data
-      files.forEach(file => {
-        // Check if file with same name already exists
-        const existingFileIndex = roomData.files.findIndex(f => f.name === file.name);
-        if (existingFileIndex !== -1) {
-          // Replace existing file
-          roomData.files[existingFileIndex] = file;
-        } else {
-          // Add new file
-          roomData.files.push(file);
+      try {
+        const roomData = rooms.get(roomId);
+        
+        // Add files to room data
+        files.forEach(file => {
+          // Check if file with same name already exists
+          const existingFileIndex = roomData.files.findIndex(f => f.name === file.name);
+          if (existingFileIndex !== -1) {
+            // Replace existing file
+            roomData.files[existingFileIndex] = file;
+          } else {
+            // Add new file
+            roomData.files.push(file);
+          }
+        });
+
+        // Limit total files per room (optional, to prevent memory issues)
+        if (roomData.files.length > 100) {
+          roomData.files = roomData.files.slice(-100); // Keep only latest 100 files
         }
-      });
 
-      // Limit total files per room (optional, to prevent memory issues)
-      if (roomData.files.length > 100) {
-        roomData.files = roomData.files.slice(-100); // Keep only latest 100 files
+        // Broadcast updated files list to all users in room
+        io.to(roomId).emit('files-updated', roomData.files);
+
+        // Send system message about file upload
+        const fileNames = files.map(f => f.name).join(', ');
+        const uploadMessage = {
+          id: `${Date.now()}-${socket.id}`,
+          sender: 'system',
+          message: `${files[0].uploadedBy} uploaded ${files.length} file(s): ${fileNames}`,
+          timestamp: new Date().toISOString(),
+          roomId
+        };
+
+        roomData.messages.push(uploadMessage);
+        io.to(roomId).emit('chat-message', uploadMessage);
+
+        console.log(`Files uploaded to room ${roomId}, total files: ${roomData.files.length}`);
+      } catch (error) {
+        console.error('Error handling file upload:', error);
+        socket.emit('upload-error', { message: 'File upload failed - file may be too large' });
       }
-
-      // Broadcast updated files list to all users in room
-      io.to(roomId).emit('files-updated', roomData.files);
-
-      // Send system message about file upload
-      const fileNames = files.map(f => f.name).join(', ');
-      const uploadMessage = {
-        id: `${Date.now()}-${socket.id}`,
-        sender: 'system',
-        message: `${files[0].uploadedBy} uploaded ${files.length} file(s): ${fileNames}`,
-        timestamp: new Date().toISOString(),
-        roomId
-      };
-
-      roomData.messages.push(uploadMessage);
-      io.to(roomId).emit('chat-message', uploadMessage);
-
-      console.log(`Files uploaded to room ${roomId}, total files: ${roomData.files.length}`);
     });
 
     // Handle file deletion

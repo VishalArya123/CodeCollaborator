@@ -65,8 +65,15 @@ const FileManager = ({ roomId, username }) => {
 
     setIsUploading(true);
     const filePromises = Array.from(uploadFiles).map(file => {
-      return new Promise((resolve) => {
+      return new Promise((resolve, reject) => {
+        // Skip files larger than 50MB
+        if (file.size > 50e6) {
+          reject(new Error(`File ${file.name} is too large (max 50MB)`));
+          return;
+        }
+
         const reader = new FileReader();
+        
         reader.onload = (e) => {
           resolve({
             id: `${Date.now()}-${Math.random()}`,
@@ -78,6 +85,11 @@ const FileManager = ({ roomId, username }) => {
             uploadedAt: new Date().toISOString()
           });
         };
+        
+        reader.onerror = () => {
+          reject(new Error(`Failed to read file ${file.name}`));
+        };
+        
         reader.readAsDataURL(file);
       });
     });
@@ -87,7 +99,7 @@ const FileManager = ({ roomId, username }) => {
       socket.emit('upload-files', { roomId, files: fileData });
     } catch (error) {
       console.error('Error uploading files:', error);
-      alert('Error uploading files. Please try again.');
+      alert(`Error uploading files: ${error.message}`);
     } finally {
       setIsUploading(false);
     }
@@ -227,7 +239,7 @@ const FileManager = ({ roomId, username }) => {
             <div className="text-2xl mb-1">📁</div>
             <div>Drop files here or click to upload</div>
             <div className="text-xs text-gray-400 mt-1">
-              Images, videos, documents, code files, etc.
+              Images, videos, documents, code files, etc. (max 50MB)
             </div>
           </div>
         )}

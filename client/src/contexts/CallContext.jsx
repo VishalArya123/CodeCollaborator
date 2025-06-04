@@ -40,7 +40,7 @@ export const CallProvider = ({ children }) => {
   // Create a peer connection
   const createPeer = (userId, callerId, stream) => {
     const peer = new SimplePeer({
-      initiator: true,
+      initiator: callerId === socket.id,
       trickle: false,
       stream,
       config: {
@@ -55,10 +55,11 @@ export const CallProvider = ({ children }) => {
       socket.emit('signal', { userId, callerId, signal: data });
     });
 
-    peer.on('stream', (stream) => {
+    peer.on('stream', (remoteStream) => {
+      console.log('Received remote stream from:', userId);
       setRemoteStreams((prev) => ({
         ...prev,
-        [userId]: stream,
+        [userId]: remoteStream,
       }));
     });
 
@@ -66,44 +67,35 @@ export const CallProvider = ({ children }) => {
       console.error('Peer connection error:', err);
     });
 
+    peer.on('close', () => {
+      console.log('Peer connection closed for:', userId);
+      if (peersRef.current[userId]) {
+        delete peersRef.current[userId];
+      }
+      // Clean up remote stream
+      setRemoteStreams(prev => {
+        const newStreams = { ...prev };
+        delete newStreams[userId];
+        return newStreams;
+      });
+    });
+
     return peer;
   };
 
   // Handle incoming signal
   const handleSignal = ({ userId, signal, callerId }) => {
-    if (peersRef.current[userId]) {
-      peersRef.current[userId].signal(signal);
-    } else {
-      const stream = localStream;
-      const peer = new SimplePeer({
-        initiator: false,
-        trickle: false,
-        stream,
-        config: {
-          iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-          ],
-        },
-      });
-
-      peer.on('signal', (data) => {
-        socket.emit('signal', { userId: callerId, callerId: socket.id, signal: data });
-      });
-
-      peer.on('stream', (stream) => {
-        setRemoteStreams((prev) => ({
-          ...prev,
-          [userId]: stream,
-        }));
-      });
-
-      peer.on('error', (err) => {
-        console.error('Peer connection error:', err);
-      });
-
+    let peer = peersRef.current[userId];
+    
+    if (!peer) {
+      peer = createPeer(userId, callerId, localStream);
       peersRef.current[userId] = peer;
+    }
+    
+    try {
       peer.signal(signal);
+    } catch (error) {
+      console.error('Error handling signal:', error);
     }
   };
 
@@ -111,11 +103,15 @@ export const CallProvider = ({ children }) => {
   const startOrJoinCall = async (roomId) => {
     if (!socket || !connected || isInCall) return;
 
-    const stream = await initializeMedia();
-    if (!stream) return;
+    try {
+      const stream = await initializeMedia();
+      if (!stream) return;
 
-    setIsInCall(true);
-    socket.emit('start-call', { roomId });
+      setIsInCall(true);
+      socket.emit('start-call', { roomId });
+    } catch (error) {
+      console.error('Error starting call:', error);
+    }
   };
 
   // Leave call
@@ -125,14 +121,21 @@ export const CallProvider = ({ children }) => {
     // Stop all tracks
     if (localStream) {
       localStream.getTracks().forEach(track => track.stop());
+      setLocalStream(null);
     }
   
     // Destroy all peers
-    Object.values(peersRef.current).forEach(peer => peer.destroy());
+    Object.values(peersRef.current).forEach(peer => {
+      try {
+        peer.destroy();
+      } catch (error) {
+        console.error('Error destroying peer:', error);
+      }
+    });
     peersRef.current = {};
   
-    setLocalStream(null);
     setRemoteStreams({});
+    setCallParticipants([]);
     setIsInCall(false);
     setMicEnabled(true);
     setVideoEnabled(true);
@@ -145,22 +148,72 @@ export const CallProvider = ({ children }) => {
   // Toggle microphone
   const toggleMic = () => {
     if (localStream) {
-      localStream.getAudioTracks().forEach((track) => {
-        track.enabled = !micEnabled;
+      const newMicState = !micEnabled;
+      localStream.getAudioTracks().forEach(track => {
+        track.enabled = newMicState;
       });
-      setMicEnabled(!micEnabled);
-      socket.emit('toggle-mic', { userId: socket.id, micEnabled: !micEnabled });
+      setMicEnabled(newMicState);
+      
+      if (socket) {
+        socket.emit('toggle-mic', { 
+          userId: socket.id, 
+          micEnabled: newMicState 
+        });
+      }
     }
   };
 
-  // Toggle video
-  const toggleVideo = () => {
-    if (localStream) {
-      localStream.getVideoTracks().forEach((track) => {
-        track.enabled = !videoEnabled;
+  // Toggle video with stream refresh
+  const toggleVideo = async () => {
+    if (!localStream) return;
+
+    const newVideoState = !videoEnabled;
+    
+    if (newVideoState) {
+      // Turning video ON - get new video stream
+      try {
+        const newStream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: true,
+        });
+        
+        // Replace video track in existing stream
+        const videoTrack = newStream.getVideoTracks()[0];
+        const audioTrack = localStream.getAudioTracks()[0];
+        
+        // Create new stream with existing audio and new video
+        const updatedStream = new MediaStream([audioTrack, videoTrack]);
+        
+        // Update local stream
+        setLocalStream(updatedStream);
+        
+        // Update all peer connections with new stream
+        Object.values(peersRef.current).forEach(peer => {
+          try {
+            peer.replaceTrack(localStream.getVideoTracks()[0], videoTrack, updatedStream);
+          } catch (error) {
+            console.error('Error replacing video track:', error);
+          }
+        });
+        
+        setVideoEnabled(true);
+      } catch (error) {
+        console.error('Error enabling video:', error);
+        return;
+      }
+    } else {
+      // Turning video OFF
+      localStream.getVideoTracks().forEach(track => {
+        track.enabled = false;
       });
-      setVideoEnabled(!videoEnabled);
-      socket.emit('toggle-video', { userId: socket.id, videoEnabled: !videoEnabled });
+      setVideoEnabled(false);
+    }
+    
+    if (socket) {
+      socket.emit('toggle-video', { 
+        userId: socket.id, 
+        videoEnabled: newVideoState 
+      });
     }
   };
 
@@ -168,69 +221,123 @@ export const CallProvider = ({ children }) => {
   useEffect(() => {
     if (!socket || !connected) return;
 
-    socket.on('call-started', ({ roomId, participants }) => {
-      setCallParticipants(participants);
-      participants.forEach((userId) => {
-        if (userId !== socket.id && localStream) {
-          const peer = createPeer(userId, socket.id, localStream);
-          peersRef.current[userId] = peer;
+    const handleCallStarted = ({ participants }) => {
+      console.log('Call started with participants:', participants);
+      setCallParticipants(participants.filter(p => p.id !== socket.id));
+      
+      // Create peer connections for existing participants
+      participants.forEach((participant) => {
+        if (participant.id !== socket.id && localStream && !peersRef.current[participant.id]) {
+          const peer = createPeer(participant.id, socket.id, localStream);
+          peersRef.current[participant.id] = peer;
         }
       });
-    });
+    };
 
-    socket.on('user-joined-call', ({ userId, username, micEnabled, videoEnabled }) => {
-      setCallParticipants((prev) => [...prev, { id: userId, username, micEnabled, videoEnabled }]);
-      if (localStream && userId !== socket.id) {
+    const handleUserJoined = ({ userId, username }) => {
+      console.log('User joined call:', username);
+      
+      setCallParticipants(prev => {
+        const exists = prev.some(p => p.id === userId);
+        if (!exists) {
+          return [...prev, { id: userId, username, micEnabled: true, videoEnabled: true }];
+        }
+        return prev;
+      });
+      
+      if (userId !== socket.id && localStream && !peersRef.current[userId]) {
         const peer = createPeer(userId, socket.id, localStream);
         peersRef.current[userId] = peer;
       }
-    });
+    };
 
-    socket.on('user-left-call', ({ userId }) => {
-      setCallParticipants((prev) => prev.filter((p) => p.id !== userId));
+    const handleUserLeft = ({ userId }) => {
+      console.log('User left call:', userId);
+      
+      setCallParticipants(prev => prev.filter(p => p.id !== userId));
+      
       if (peersRef.current[userId]) {
-        peersRef.current[userId].destroy();
+        try {
+          peersRef.current[userId].destroy();
+        } catch (error) {
+          console.error('Error destroying peer on user leave:', error);
+        }
         delete peersRef.current[userId];
       }
-      setRemoteStreams((prev) => {
+      
+      setRemoteStreams(prev => {
         const newStreams = { ...prev };
         delete newStreams[userId];
         return newStreams;
       });
-    });
+    };
 
+    const handleToggleMic = ({ userId, micEnabled }) => {
+      setCallParticipants(prev =>
+        prev.map(p => p.id === userId ? { ...p, micEnabled } : p)
+      );
+    };
+
+    const handleToggleVideo = ({ userId, videoEnabled }) => {
+      setCallParticipants(prev =>
+        prev.map(p => p.id === userId ? { ...p, videoEnabled } : p)
+      );
+    };
+
+    const handleCallEnded = () => {
+      console.log('Call ended by server');
+      leaveCall();
+    };
+
+    socket.on('call-started', handleCallStarted);
+    socket.on('user-joined-call', handleUserJoined);
+    socket.on('user-left-call', handleUserLeft);
     socket.on('signal', handleSignal);
-
-    socket.on('toggle-mic', ({ userId, micEnabled }) => {
-      setCallParticipants((prev) =>
-        prev.map((p) => (p.id === userId ? { ...p, micEnabled } : p))
-      );
-    });
-
-    socket.on('toggle-video', ({ userId, videoEnabled }) => {
-      setCallParticipants((prev) =>
-        prev.map((p) => (p.id === userId ? { ...p, videoEnabled } : p))
-      );
-    });
+    socket.on('toggle-mic', handleToggleMic);
+    socket.on('toggle-video', handleToggleVideo);
+    socket.on('call-ended', handleCallEnded);
 
     return () => {
-      socket.off('call-started');
-      socket.off('user-joined-call');
-      socket.off('user-left-call');
-      socket.off('signal');
-      socket.off('toggle-mic');
-      socket.off('toggle-video');
+      socket.off('call-started', handleCallStarted);
+      socket.off('user-joined-call', handleUserJoined);
+      socket.off('user-left-call', handleUserLeft);
+      socket.off('signal', handleSignal);
+      socket.off('toggle-mic', handleToggleMic);
+      socket.off('toggle-video', handleToggleVideo);
+      socket.off('call-ended', handleCallEnded);
     };
   }, [socket, connected, localStream]);
+
+  // Update peer connections when local stream changes
+  useEffect(() => {
+    if (localStream) {
+      Object.values(peersRef.current).forEach(peer => {
+        try {
+          // This will help refresh the stream for existing peers
+          if (peer.streams && peer.streams[0] !== localStream) {
+            peer.removeStream(peer.streams[0]);
+            peer.addStream(localStream);
+          }
+        } catch (error) {
+          console.error('Error updating peer stream:', error);
+        }
+      });
+    }
+  }, [localStream]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
       if (localStream) {
-        localStream.getTracks().forEach((track) => track.stop());
+        localStream.getTracks().forEach(track => track.stop());
       }
-      Object.values(peersRef.current).forEach((peer) => peer.destroy());
-      peersRef.current = {};
+      Object.values(peersRef.current).forEach(peer => {
+        try {
+          peer.destroy();
+        } catch (error) {
+          console.error('Error destroying peer on cleanup:', error);
+        }
+      });
     };
   }, []);
 

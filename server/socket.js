@@ -29,14 +29,15 @@ function setupSocketServer(io) {
       if (!rooms.has(roomId)) {
         rooms.set(roomId, {
           users: [],
-          messages: [], // Store chat messages
-          files: [], // Store uploaded files
+          messages: [],
+          files: [],
           code: {
             html: '',
             css: '',
             js: ''
           },
           activeUsers: 0,
+          callParticipants: [], // Track users in call
           createdAt: new Date()
         });
       }
@@ -51,7 +52,10 @@ function setupSocketServer(io) {
         const user = {
           id: socket.id,
           username,
-          joinedAt: new Date()
+          joinedAt: new Date(),
+          isInCall: false, // Initialize call status
+          micEnabled: true,
+          videoEnabled: true,
         };
 
         roomData.users.push(user);
@@ -87,15 +91,23 @@ function setupSocketServer(io) {
       socket.emit('room-joined', {
         roomId,
         users: roomData.users,
-        messages: roomData.messages, // Send message history
-        files: roomData.files, // Send files
+        messages: roomData.messages,
+        files: roomData.files,
         code: roomData.code
       });
+
+      // Send call status if a call is active
+      if (roomData.callParticipants.length > 0) {
+        socket.emit('call-started', {
+          roomId,
+          participants: roomData.callParticipants.map(p => p.id)
+        });
+      }
 
       console.log(`Room ${roomId} now has ${roomData.users.length} users`);
     });
 
-    // Handle request for room messages (for reconnection/tab switching)
+    // Handle request for room messages
     socket.on('get-room-messages', ({ roomId }) => {
       console.log(`User ${socket.id} requesting messages for room: ${roomId}`);
       
@@ -138,28 +150,21 @@ function setupSocketServer(io) {
       try {
         const roomData = rooms.get(roomId);
         
-        // Add files to room data
         files.forEach(file => {
-          // Check if file with same name already exists
           const existingFileIndex = roomData.files.findIndex(f => f.name === file.name);
           if (existingFileIndex !== -1) {
-            // Replace existing file
             roomData.files[existingFileIndex] = file;
           } else {
-            // Add new file
             roomData.files.push(file);
           }
         });
 
-        // Limit total files per room (optional, to prevent memory issues)
         if (roomData.files.length > 100) {
-          roomData.files = roomData.files.slice(-100); // Keep only latest 100 files
+          roomData.files = roomData.files.slice(-100);
         }
 
-        // Broadcast updated files list to all users in room
         io.to(roomId).emit('files-updated', roomData.files);
 
-        // Send system message about file upload
         const fileNames = files.map(f => f.name).join(', ');
         const uploadMessage = {
           id: `${Date.now()}-${socket.id}`,
@@ -195,10 +200,8 @@ function setupSocketServer(io) {
         const deletedFile = roomData.files[fileIndex];
         roomData.files.splice(fileIndex, 1);
 
-        // Broadcast updated files list to all users in room
         io.to(roomId).emit('files-updated', roomData.files);
 
-        // Send system message about file deletion
         const deleteMessage = {
           id: `${Date.now()}-${socket.id}`,
           sender: 'system',
@@ -220,7 +223,6 @@ function setupSocketServer(io) {
         const roomData = rooms.get(roomId);
         roomData.code[language] = code;
 
-        // Broadcast code changes to all users in the room except sender
         socket.to(roomId).emit('code-update', {
           language,
           code
@@ -248,28 +250,24 @@ function setupSocketServer(io) {
 
       const roomData = rooms.get(roomId);
       
-      // Create message object
       const messageData = {
         id: `${Date.now()}-${socket.id}`,
         sender: username,
-        username: username, // Add both for compatibility
+        username: username,
         userId: socket.id,
         message: message.trim(),
         timestamp: timestamp || new Date().toISOString(),
         roomId
       };
 
-      // Store message in room
       roomData.messages.push(messageData);
 
-      // Keep only last 1000 messages per room to prevent memory issues
       if (roomData.messages.length > 1000) {
         roomData.messages = roomData.messages.slice(-1000);
       }
 
       console.log(`Broadcasting message to room ${roomId}, room has ${roomData.users.length} users`);
       
-      // Broadcast to ALL users in the room (including sender for confirmation)
       io.to(roomId).emit('chat-message', messageData);
     });
 
@@ -282,6 +280,68 @@ function setupSocketServer(io) {
       });
     });
 
+    // Handle call-related events
+    socket.on('start-call', ({ roomId }) => {
+      if (!rooms.has(roomId)) return;
+      
+      const roomData = rooms.get(roomId);
+      const user = roomData.users.find(u => u.id === socket.id);
+      if (!user) return;
+    
+      // Initialize callParticipants if it doesn't exist
+      if (!roomData.callParticipants) {
+        roomData.callParticipants = [];
+      }
+    
+      // Check if user is already in call
+      const alreadyInCall = roomData.callParticipants.some(p => p.id === socket.id);
+      if (!alreadyInCall) {
+        roomData.callParticipants.push({
+          id: socket.id,
+          username: user.username,
+          micEnabled: true,
+          videoEnabled: true,
+        });
+        user.isInCall = true;
+    
+        io.to(roomId).emit('call-started', {
+          roomId,
+          participants: roomData.callParticipants
+        });
+      }
+    });
+
+    socket.on('leave-call', ({ roomId }) => {
+      console.log(`User ${socket.id} leaving call in room: ${roomId}`);
+      handleCallLeaving(socket, roomId, io);
+    });
+
+    socket.on('signal', ({ userId, callerId, signal }) => {
+      io.to(userId).emit('signal', { userId: callerId, callerId: socket.id, signal });
+    });
+
+    socket.on('toggle-mic', ({ userId, micEnabled, roomId }) => {  // Add roomId parameter
+      if (rooms.has(roomId)) {
+        const roomData = rooms.get(roomId);
+        const participant = roomData.callParticipants.find(p => p.id === userId);
+        if (participant) {
+          participant.micEnabled = micEnabled;
+          io.to(roomId).emit('toggle-mic', { userId, micEnabled });
+        }
+      }
+    });
+    
+    socket.on('toggle-video', ({ userId, videoEnabled, roomId }) => {  // Add roomId parameter
+      if (rooms.has(roomId)) {
+        const roomData = rooms.get(roomId);
+        const participant = roomData.callParticipants.find(p => p.id === userId);
+        if (participant) {
+          participant.videoEnabled = videoEnabled;
+          io.to(roomId).emit('toggle-video', { userId, videoEnabled });
+        }
+      }
+    });
+
     // Handle explicit room leaving
     socket.on('leave-room', ({ roomId, username }) => {
       console.log(`User ${username} explicitly leaving room: ${roomId}`);
@@ -292,29 +352,24 @@ function setupSocketServer(io) {
     socket.on('disconnect', (reason) => {
       console.log(`User disconnected: ${socket.id}, reason: ${reason}`);
 
-      // Find which room the user was in and handle leaving
       for (const [roomId, roomData] of rooms.entries()) {
         const userIndex = roomData.users.findIndex(user => user.id === socket.id);
 
         if (userIndex !== -1) {
           const username = roomData.users[userIndex].username;
           
-          // For temporary disconnections (like tab switching), don't immediately remove user
           if (reason === 'transport close' || reason === 'ping timeout') {
             console.log(`Temporary disconnect for ${username}, keeping in room for potential reconnection`);
-            // Mark user as temporarily disconnected but don't remove immediately
             roomData.users[userIndex].disconnectedAt = new Date();
             
-            // Set a timeout to remove user if they don't reconnect within 30 seconds
             setTimeout(() => {
               const currentUser = roomData.users.find(user => user.id === socket.id);
               if (currentUser && currentUser.disconnectedAt) {
                 console.log(`User ${username} did not reconnect, removing from room`);
                 handleUserLeaving(socket, roomId, username, io);
               }
-            }, 30000); // 30 second grace period
+            }, 30000);
           } else {
-            // Immediate disconnect for other reasons
             handleUserLeaving(socket, roomId, username, io);
           }
           break;
@@ -330,14 +385,22 @@ function setupSocketServer(io) {
       const userIndex = roomData.users.findIndex(user => user.id === socket.id);
 
       if (userIndex !== -1) {
+        // Remove user from call participants if they are in the call
+        if (roomData.callParticipants) {
+          const participantIndex = roomData.callParticipants.findIndex(p => p.id === socket.id);
+          if (participantIndex !== -1) {
+            roomData.callParticipants.splice(participantIndex, 1);
+            roomData.users[userIndex].isInCall = false;
+            io.to(roomId).emit('user-left-call', { userId: socket.id });
+          }
+        }
+
         // Remove user from the room
         roomData.users.splice(userIndex, 1);
         roomData.activeUsers = Math.max(0, roomData.activeUsers - 1);
 
-        // Leave the socket room
         socket.leave(roomId);
 
-        // Create leave message
         const leaveMessage = {
           id: `${Date.now()}-${socket.id}`,
           sender: 'system',
@@ -346,39 +409,51 @@ function setupSocketServer(io) {
           roomId
         };
 
-        // Store the message
         roomData.messages.push(leaveMessage);
 
-        // Notify other users
         socket.to(roomId).emit('user-left', {
           userId: socket.id,
           username,
           users: roomData.users
         });
 
-        // Send system message
         io.to(roomId).emit('chat-message', leaveMessage);
 
         console.log(`User ${username} left room ${roomId}, ${roomData.users.length} users remaining`);
 
-        // Clean up empty rooms after a delay to allow for reconnections
         if (roomData.users.length === 0) {
           setTimeout(() => {
             if (rooms.has(roomId) && rooms.get(roomId).users.length === 0) {
               rooms.delete(roomId);
               console.log(`Room ${roomId} has been deleted (no users)`);
             }
-          }, 60000); // Wait 1 minute before deleting empty room
+          }, 60000);
         }
       }
     }
   }
 
-  // Optional: Add a cleanup function to run periodically
+  // Helper function to handle call leaving
+  function handleCallLeaving(socket, roomId, io) {
+    if (rooms.has(roomId)) {
+      const roomData = rooms.get(roomId);
+      const participantIndex = roomData.callParticipants.findIndex(p => p.id === socket.id);
+      const user = roomData.users.find(u => u.id === socket.id);
+
+      if (participantIndex !== -1 && user) {
+        roomData.callParticipants.splice(participantIndex, 1);
+        user.isInCall = false;
+
+        io.to(roomId).emit('user-left-call', { userId: socket.id });
+        console.log(`User ${socket.id} left call in room ${roomId}, ${roomData.callParticipants.length} participants remaining`);
+      }
+    }
+  }
+
+  // Periodic cleanup
   const cleanupInterval = setInterval(() => {
     let cleaned = 0;
     for (const [roomId, roomData] of rooms.entries()) {
-      // Remove rooms that have been empty for more than 1 hour
       if (roomData.users.length === 0 && 
           (Date.now() - roomData.createdAt.getTime()) > 3600000) {
         rooms.delete(roomId);
@@ -388,9 +463,8 @@ function setupSocketServer(io) {
     if (cleaned > 0) {
       console.log(`Cleaned up ${cleaned} empty rooms`);
     }
-  }, 300000); // Run every 5 minutes
+  }, 300000);
 
-  // Clean up interval on server shutdown
   process.on('SIGTERM', () => {
     clearInterval(cleanupInterval);
   });
@@ -400,7 +474,7 @@ function setupSocketServer(io) {
   });
 }
 
-// Optional: Function to get room statistics (for debugging/monitoring)
+// Optional: Function to get room statistics
 function getRoomStats() {
   const stats = {
     totalRooms: rooms.size,
@@ -415,6 +489,7 @@ function getRoomStats() {
       userCount: roomData.users.length,
       messageCount: roomData.messages.length,
       fileCount: roomData.files.length,
+      callParticipantCount: roomData.callParticipants ? roomData.callParticipants.length : 0,
       createdAt: roomData.createdAt
     });
   }
@@ -424,5 +499,5 @@ function getRoomStats() {
 
 module.exports = { 
   setupSocketServer,
-  getRoomStats // Export for potential monitoring endpoints
+  getRoomStats
 };

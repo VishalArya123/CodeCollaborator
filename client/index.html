@@ -6,6 +6,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CodeTogether - Collaborative Code Editor</title>
     <meta name="description" content="Real-time collaborative code editor for developer teams" />
+    <script>
+      // Add this polyfill for simple-peer
+      window.global = window;
+      window.process = { env: {} };
+    </script>
   </head>
   <body>
     <div id="root"></div>

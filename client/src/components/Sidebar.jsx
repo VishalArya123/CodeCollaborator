@@ -2,6 +2,7 @@ import { useState } from 'react';
 import UserList from './UserList';
 import Chat from './Chat';
 import FileManager from './FileManager';
+import CallSection from './CallSection'; // Import the new CallSection component
 
 const Sidebar = ({ users, roomId, username }) => {
   const [activeTab, setActiveTab] = useState('users');
@@ -64,15 +65,31 @@ const Sidebar = ({ users, roomId, username }) => {
         >
           Chat
         </button>
+        <button
+          className={`flex-1 py-2 text-sm font-medium relative ${
+            activeTab === 'call' 
+              ? 'text-blue-600 border-b-2 border-blue-600' 
+              : 'text-gray-600 hover:text-gray-800'
+          }`}
+          onClick={() => setActiveTab('call')}
+        >
+          Call
+          {/* Participant count badge */}
+          <span className="absolute top-1 right-1 text-xs bg-blue-100 text-blue-800 rounded-full px-2">
+            {users.filter((u) => u.isInCall).length}
+          </span>
+        </button>
       </div>
 
-      {/* Main content area - Users/Chat */}
+      {/* Main content area - Users/Chat/Call */}
       <div className="flex-1 overflow-hidden flex flex-col min-h-0">
         <div className="flex-1 overflow-hidden">
           {activeTab === 'users' ? (
             <UserList users={users} currentUsername={username} />
-          ) : (
+          ) : activeTab === 'chat' ? (
             <Chat roomId={roomId} username={username} />
+          ) : (
+            <CallSection roomId={roomId} username={username} />
           )}
         </div>
       </div>

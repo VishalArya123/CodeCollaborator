@@ -4,6 +4,7 @@ const http = require('http');
 const cors = require('cors');
 const { Server } = require('socket.io');
 const roomRoutes = require('./routes/room');
+const callController = require('./controllers/callController'); // Import call controller
 const { setupSocketServer } = require('./socket');
 
 const app = express();
@@ -23,6 +24,9 @@ app.use(express.json());
 // Routes
 app.use('/api/rooms', roomRoutes);
 
+// Call-related routes
+app.get('/api/rooms/:roomId/call-status', callController.checkCallStatus);
+
 // Basic route
 app.get('/', (req, res) => {
   res.send('Collaborative Code Editor API is running!');
@@ -36,7 +40,7 @@ const io = new Server(server, {
     methods: ['GET', 'POST'],
     credentials: true
   },
-  debug: true  // Add this for debugging
+  debug: true
 });
 
 // Initialize socket server

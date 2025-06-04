@@ -58,9 +58,12 @@ const UserList = ({ users, currentUsername }) => {
                   )}
                 </p>
                 
-                {/* Online Status */}
-                <div className="flex items-center">
+                {/* Online and Call Status */}
+                <div className="flex items-center space-x-1">
                   <div className="w-2 h-2 bg-green-400 rounded-full"></div>
+                  {user.isInCall && (
+                    <span className="text-xs text-green-600">📹</span>
+                  )}
                 </div>
               </div>
               

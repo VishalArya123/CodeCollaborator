@@ -14,6 +14,7 @@ export const SocketProvider = ({ children }) => {
   const [connected, setConnected] = useState(false);
   const [messages, setMessages] = useState({});
   const [typingUsers, setTypingUsers] = useState({});
+  const [users, setUsers] = useState([]); // Added to track users with call status
   const reconnectAttempts = useRef(0);
   const maxReconnectAttempts = 5;
 
@@ -115,11 +116,12 @@ export const SocketProvider = ({ children }) => {
       }
     });
 
-    socketInstance.on('room-joined', ({ roomId, messages: roomMessages, users, files }) => {
+    socketInstance.on('room-joined', ({ roomId, messages: roomMessages, users: roomUsers, files }) => {
       console.log('Room joined:', roomId, 'with', roomMessages?.length || 0, 'messages');
       if (roomMessages && roomMessages.length > 0) {
         setRoomMessages(roomId, roomMessages);
       }
+      setUsers(roomUsers); // Update users with call status
     });
 
     socketInstance.on('room-messages', ({ roomId, messages: roomMessages }) => {
@@ -133,8 +135,46 @@ export const SocketProvider = ({ children }) => {
       updateTypingUsers(roomId, username, isTyping);
     });
 
-    socketInstance.on('user-left', ({ roomId, username }) => {
-      updateTypingUsers(roomId, username, false);
+    socketInstance.on('user-joined', ({ users: roomUsers }) => {
+      setUsers(roomUsers);
+    });
+
+    socketInstance.on('user-left', ({ users: roomUsers }) => {
+      setUsers(roomUsers);
+    });
+
+    socketInstance.on('user-joined-call', ({ userId, username, micEnabled, videoEnabled }) => {
+      setUsers((prev) =>
+        prev.map((user) =>
+          user.id === userId
+            ? { ...user, isInCall: true, micEnabled, videoEnabled }
+            : user
+        )
+      );
+    });
+
+    socketInstance.on('user-left-call', ({ userId }) => {
+      setUsers((prev) =>
+        prev.map((user) =>
+          user.id === userId ? { ...user, isInCall: false } : user
+        )
+      );
+    });
+
+    socketInstance.on('toggle-mic', ({ userId, micEnabled }) => {
+      setUsers((prev) =>
+        prev.map((user) =>
+          user.id === userId ? { ...user, micEnabled } : user
+        )
+      );
+    });
+
+    socketInstance.on('toggle-video', ({ userId, videoEnabled }) => {
+      setUsers((prev) =>
+        prev.map((user) =>
+          user.id === userId ? { ...user, videoEnabled } : user
+        )
+      );
     });
 
     setSocket(socketInstance);
@@ -169,6 +209,7 @@ export const SocketProvider = ({ children }) => {
     updateTypingUsers,
     joinRoom,
     leaveRoom,
+    users,
     reconnectAttempts: reconnectAttempts.current,
     maxReconnectAttempts
   };

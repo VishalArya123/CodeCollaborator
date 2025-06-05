@@ -100,7 +100,7 @@ function setupSocketServer(io) {
       if (roomData.callParticipants.length > 0) {
         socket.emit('call-started', {
           roomId,
-          participants: roomData.callParticipants.map(p => p.id)
+          participants: roomData.callParticipants
         });
       }
 
@@ -288,26 +288,37 @@ function setupSocketServer(io) {
       const user = roomData.users.find(u => u.id === socket.id);
       if (!user) return;
     
-      // Initialize callParticipants if it doesn't exist
       if (!roomData.callParticipants) {
         roomData.callParticipants = [];
       }
     
-      // Check if user is already in call
       const alreadyInCall = roomData.callParticipants.some(p => p.id === socket.id);
       if (!alreadyInCall) {
-        roomData.callParticipants.push({
+        const participant = {
           id: socket.id,
           username: user.username,
           micEnabled: true,
           videoEnabled: true,
-        });
+        };
+        
+        roomData.callParticipants.push(participant);
         user.isInCall = true;
     
+        // Notify all users in the room about the call state
         io.to(roomId).emit('call-started', {
           roomId,
           participants: roomData.callParticipants
         });
+        
+        // Notify specifically about this user joining the call
+        socket.to(roomId).emit('user-joined-call', {
+          userId: socket.id,
+          username: user.username,
+          micEnabled: true,
+          videoEnabled: true
+        });
+        
+        console.log(`User ${user.username} started/joined call in room ${roomId}`);
       }
     });
 
@@ -317,10 +328,11 @@ function setupSocketServer(io) {
     });
 
     socket.on('signal', ({ userId, callerId, signal }) => {
+      console.log(`Relaying signal from ${callerId} to ${userId}`);
       io.to(userId).emit('signal', { userId: callerId, callerId: socket.id, signal });
     });
 
-    socket.on('toggle-mic', ({ userId, micEnabled, roomId }) => {  // Add roomId parameter
+    socket.on('toggle-mic', ({ userId, micEnabled, roomId }) => {
       if (rooms.has(roomId)) {
         const roomData = rooms.get(roomId);
         const participant = roomData.callParticipants.find(p => p.id === userId);
@@ -331,7 +343,7 @@ function setupSocketServer(io) {
       }
     });
     
-    socket.on('toggle-video', ({ userId, videoEnabled, roomId }) => {  // Add roomId parameter
+    socket.on('toggle-video', ({ userId, videoEnabled, roomId }) => {
       if (rooms.has(roomId)) {
         const roomData = rooms.get(roomId);
         const participant = roomData.callParticipants.find(p => p.id === userId);

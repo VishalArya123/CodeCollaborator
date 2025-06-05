@@ -304,21 +304,13 @@ function setupSocketServer(io) {
         roomData.callParticipants.push(participant);
         user.isInCall = true;
     
-        // Notify all users in the room about the call state
+        // Broadcast to all participants
         io.to(roomId).emit('call-started', {
           roomId,
           participants: roomData.callParticipants
         });
         
-        // Notify specifically about this user joining the call
-        socket.to(roomId).emit('user-joined-call', {
-          userId: socket.id,
-          username: user.username,
-          micEnabled: true,
-          videoEnabled: true
-        });
-        
-        console.log(`User ${user.username} started/joined call in room ${roomId}`);
+        console.log(`User ${user.username} joined call in room ${roomId}`);
       }
     });
 
@@ -329,7 +321,12 @@ function setupSocketServer(io) {
 
     socket.on('signal', ({ userId, callerId, signal }) => {
       console.log(`Relaying signal from ${callerId} to ${userId}`);
-      io.to(userId).emit('signal', { userId: callerId, callerId: socket.id, signal });
+      io.to(userId).emit('signal', { 
+        userId: callerId, 
+        callerId: socket.id, 
+        signal,
+        roomId: Array.from(socket.rooms)[1] // Include room ID
+      });
     });
 
     socket.on('toggle-mic', ({ userId, micEnabled, roomId }) => {

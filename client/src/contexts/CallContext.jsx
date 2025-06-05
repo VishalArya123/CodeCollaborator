@@ -1,6 +1,19 @@
 import { createContext, useContext, useEffect, useRef, useState } from 'react';
 import { useSocket } from './SocketContext';
-import SimplePeer from 'simple-peer';
+import * as mediasoupClient from 'mediasoup-client';
+
+// Utility for Socket.IO request-response pattern
+const socketRequest = (socket, event, data) => {
+  return new Promise((resolve, reject) => {
+    socket.emit(event, data, (response) => {
+      if (response.error) {
+        reject(new Error(response.error));
+      } else {
+        resolve(response);
+      }
+    });
+  });
+};
 
 const CallContext = createContext();
 
@@ -16,8 +29,170 @@ export const CallProvider = ({ children }) => {
   const [isInCall, setIsInCall] = useState(false);
   const [micEnabled, setMicEnabled] = useState(true);
   const [videoEnabled, setVideoEnabled] = useState(true);
+  const [currentPage, setCurrentPage] = useState(0);
   const peersRef = useRef({});
   const localVideoRef = useRef(null);
+  const deviceRef = useRef(null);
+  const sendTransportRef = useRef(null);
+  const recvTransportRef = useRef(null);
+  const producersRef = useRef({});
+  const consumersRef = useRef({});
+  const PAGE_SIZE = 4; // Show 4 participants per page
+
+  // Initialize mediasoup device
+  const initializeDevice = async () => {
+    if (!socket || !connected) return;
+    try {
+      deviceRef.current = new mediasoupClient.Device();
+      
+      const routerRtpCapabilities = await socketRequest(socket, 'getRouterRtpCapabilities', { 
+        roomId: Array.from(socket.rooms || new Set()).find(room => room !== socket.id)
+      });
+      
+      await deviceRef.current.load({ routerRtpCapabilities });
+    } catch (error) {
+      console.error('Error initializing mediasoup device:', error);
+    }
+  };
+
+  // Create transports
+  const createTransports = async () => {
+    if (!socket || !connected) return;
+    try {
+      const roomId = Array.from(socket.rooms || new Set()).find(room => room !== socket.id);
+      if (!roomId) throw new Error('No room joined');
+
+      // Create send transport
+      const sendTransportData = await socketRequest(socket, 'createWebRtcTransport', { roomId });
+      
+      sendTransportRef.current = deviceRef.current.createSendTransport(sendTransportData);
+      
+      sendTransportRef.current.on('connect', async ({ dtlsParameters }, callback, errback) => {
+        try {
+          await socketRequest(socket, 'connectTransport', {
+            transportId: sendTransportRef.current.id,
+            dtlsParameters,
+            roomId
+          });
+          callback();
+        } catch (error) {
+          errback(error);
+        }
+      });
+      
+      sendTransportRef.current.on('produce', async ({ kind, rtpParameters }, callback, errback) => {
+        try {
+          const { id } = await socketRequest(socket, 'produce', {
+            transportId: sendTransportRef.current.id,
+            kind,
+            rtpParameters,
+            roomId
+          });
+          callback({ id });
+        } catch (error) {
+          errback(error);
+        }
+      });
+
+      // Create receive transport
+      const recvTransportData = await socketRequest(socket, 'createWebRtcTransport', { roomId });
+      
+      recvTransportRef.current = deviceRef.current.createRecvTransport(recvTransportData);
+      
+      recvTransportRef.current.on('connect', async ({ dtlsParameters }, callback, errback) => {
+        try {
+          await socketRequest(socket, 'connectTransport', {
+            transportId: recvTransportRef.current.id,
+            dtlsParameters,
+            roomId
+          });
+          callback();
+        } catch (error) {
+          errback(error);
+        }
+      });
+    } catch (error) {
+      console.error('Error creating transports:', error);
+    }
+  };
+
+  // Produce local media
+  const produceMedia = async () => {
+    if (!localStream || !sendTransportRef.current) return;
+    
+    try {
+      // Produce audio
+      if (localStream.getAudioTracks().length > 0) {
+        const audioTrack = localStream.getAudioTracks()[0];
+        const audioProducer = await sendTransportRef.current.produce({
+          track: audioTrack,
+          codecOptions: {
+            opusStereo: true,
+            opusDtx: true
+          }
+        });
+        producersRef.current.audio = audioProducer;
+      }
+      
+      // Produce video
+      if (localStream.getVideoTracks().length > 0) {
+        const videoTrack = localStream.getVideoTracks()[0];
+        const videoProducer = await sendTransportRef.current.produce({
+          track: videoTrack,
+          encodings: [
+            { maxBitrate: 1000000 },
+            { maxBitrate: 500000 },
+            { maxBitrate: 250000 }
+          ],
+          codecOptions: {
+            videoGoogleStartBitrate: 1000
+          }
+        });
+        producersRef.current.video = videoProducer;
+      }
+    } catch (error) {
+      console.error('Error producing media:', error);
+    }
+  };
+
+  // Consume remote media
+  const consumeMedia = async (userId) => {
+    if (!recvTransportRef.current || !socket || !connected) return;
+    
+    try {
+      const roomId = Array.from(socket.rooms || new Set()).find(room => room !== socket.id);
+      if (!roomId) throw new Error('No room joined');
+
+      const { producers } = await socketRequest(socket, 'getProducers', { userId, roomId });
+      
+      const stream = new MediaStream();
+      
+      for (const producer of producers) {
+        const { id, kind } = producer;
+        
+        const consumer = await recvTransportRef.current.consume({
+          producerId: id,
+          rtpCapabilities: deviceRef.current.rtpCapabilities,
+          paused: kind === 'video'
+        });
+        
+        consumersRef.current[`${userId}-${kind}`] = consumer;
+        
+        stream.addTrack(consumer.track);
+        
+        if (kind === 'video') {
+          await socketRequest(socket, 'resumeConsumer', { consumerId: consumer.id, roomId });
+        }
+      }
+      
+      setRemoteStreams(prev => ({
+        ...prev,
+        [userId]: stream
+      }));
+    } catch (error) {
+      console.error('Error consuming media:', error);
+    }
+  };
 
   // Initialize local media stream
   const initializeMedia = async () => {
@@ -37,94 +212,39 @@ export const CallProvider = ({ children }) => {
     }
   };
 
-  // Create a peer connection
-  const createPeer = (userId, callerId, stream) => {
-    const peer = new SimplePeer({
-      initiator: callerId === socket.id,
-      trickle: false,
-      stream,
-      config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-        ],
-      },
-    });
-
-    peer.on('signal', (data) => {
-      socket.emit('signal', { userId, callerId, signal: data });
-    });
-
-    peer.on('stream', (remoteStream) => {
-      console.log('Received remote stream from:', userId);
-      setRemoteStreams(prev => ({
-        ...prev,
-        [userId]: remoteStream,
-      }));
-    });
-
-    peer.on('error', (err) => {
-      console.error('Peer connection error:', err);
-    });
-
-    peer.on('close', () => {
-      console.log('Peer connection closed for:', userId);
-      removePeer(userId);
-    });
-
-    return peer;
-  };
-
-  // Remove peer connection
-  const removePeer = (userId) => {
-    if (peersRef.current[userId]) {
-      peersRef.current[userId].destroy();
-      delete peersRef.current[userId];
-    }
-    setRemoteStreams(prev => {
-      const newStreams = { ...prev };
-      delete newStreams[userId];
-      return newStreams;
-    });
-  };
-
-  // Handle incoming signal
-  const handleSignal = ({ userId, signal, callerId }) => {
-    let peer = peersRef.current[userId];
-    
-    if (!peer) {
-      peer = createPeer(userId, callerId, localStream);
-      peersRef.current[userId] = peer;
-    }
-    
-    try {
-      peer.signal(signal);
-    } catch (error) {
-      console.error('Error handling signal:', error);
-    }
-  };
-
-  // Start or join a call
-  const startOrJoinCall = async (roomId) => {
-    if (!socket || !connected || isInCall) return;
-
-    try {
-      const stream = await initializeMedia();
-      if (!stream) return;
-
-      setIsInCall(true);
-      socket.emit('start-call', { roomId });
-    } catch (error) {
-      console.error('Error starting call:', error);
-    }
-  };
-
   // Properly stop all media tracks
   const stopAllTracks = (stream) => {
     if (stream) {
       stream.getTracks().forEach(track => {
         track.stop();
       });
+    }
+  };
+
+  // Start or join a call
+  const startOrJoinCall = async (roomId) => {
+    if (!socket || !connected || isInCall) return;
+  
+    try {
+      let stream = localStream;
+      if (!stream) {
+        stream = await initializeMedia();
+        if (!stream) return;
+      }
+  
+      setIsInCall(true);
+      
+      // Initialize mediasoup
+      await initializeDevice();
+      await createTransports();
+      await produceMedia();
+      
+      socket.emit('start-call', { roomId });
+      
+      console.log('Joined call in room:', roomId);
+    } catch (error) {
+      console.error('Error starting call:', error);
+      setIsInCall(false);
     }
   };
 
@@ -138,16 +258,37 @@ export const CallProvider = ({ children }) => {
       setLocalStream(null);
     }
   
-    // Destroy all peers
-    Object.values(peersRef.current).forEach(peer => {
+    // Close all producers and consumers
+    Object.values(producersRef.current).forEach(producer => {
       try {
-        peer.destroy();
+        producer.close();
       } catch (error) {
-        console.error('Error destroying peer:', error);
+        console.error('Error closing producer:', error);
       }
     });
-    peersRef.current = {};
-  
+    
+    Object.values(consumersRef.current).forEach(consumer => {
+      try {
+        consumer.close();
+      } catch (error) {
+        console.error('Error closing consumer:', error);
+      }
+    });
+    
+    producersRef.current = {};
+    consumersRef.current = {};
+    
+    // Close transports
+    if (sendTransportRef.current) {
+      sendTransportRef.current.close();
+      sendTransportRef.current = null;
+    }
+    
+    if (recvTransportRef.current) {
+      recvTransportRef.current.close();
+      recvTransportRef.current = null;
+    }
+    
     // Clean up remote streams
     Object.values(remoteStreams).forEach(stream => {
       stopAllTracks(stream);
@@ -159,36 +300,39 @@ export const CallProvider = ({ children }) => {
     setMicEnabled(true);
     setVideoEnabled(true);
   
-    if (socket) {
+    if (socket && connected) {
       socket.emit('leave-call', { roomId });
     }
   };
 
   // Toggle microphone
   const toggleMic = () => {
-    if (localStream) {
-      const newMicState = !micEnabled;
-      localStream.getAudioTracks().forEach(track => {
-        track.enabled = newMicState;
+    if (!localStream || !socket || !connected) return;
+    
+    const newMicState = !micEnabled;
+    localStream.getAudioTracks().forEach(track => {
+      track.enabled = newMicState;
+    });
+    setMicEnabled(newMicState);
+    
+    const roomId = Array.from(socket.rooms || new Set()).find(room => room !== socket.id);
+    if (roomId && socket) {
+      socket.emit('toggle-mic', { 
+        userId: socket.id, 
+        micEnabled: newMicState,
+        roomId
       });
-      setMicEnabled(newMicState);
-      
-      if (socket) {
-        socket.emit('toggle-mic', { 
-          userId: socket.id, 
-          micEnabled: newMicState,
-          roomId: Array.from(socket.rooms)[1] // Get current room ID
-        });
-      }
     }
   };
 
   // Toggle video
   const toggleVideo = async () => {
-    if (!localStream) return;
+    if (!localStream || !socket || !connected) return;
 
     const newVideoState = !videoEnabled;
-    
+    const roomId = Array.from(socket.rooms || new Set()).find(room => room !== socket.id);
+    if (!roomId) return;
+
     if (newVideoState) {
       // Turning video ON
       try {
@@ -212,17 +356,26 @@ export const CallProvider = ({ children }) => {
           localVideoRef.current.srcObject = updatedStream;
         }
         
-        // Update all peers
-        Object.values(peersRef.current).forEach(peer => {
-          try {
-            const sender = peer._pc.getSenders().find(s => s.track?.kind === 'video');
-            if (sender) {
-              sender.replaceTrack(newVideoTrack);
+        // Replace video producer
+        if (producersRef.current.video) {
+          producersRef.current.video.close();
+          delete producersRef.current.video;
+        }
+        
+        if (sendTransportRef.current) {
+          const videoProducer = await sendTransportRef.current.produce({
+            track: newVideoTrack,
+            encodings: [
+              { maxBitrate: 1000000 },
+              { maxBitrate: 500000 },
+              { maxBitrate: 250000 }
+            ],
+            codecOptions: {
+              videoGoogleStartBitrate: 1000
             }
-          } catch (error) {
-            console.error('Error replacing video track:', error);
-          }
-        });
+          });
+          producersRef.current.video = videoProducer;
+        }
         
         // Clean up
         newStream.getAudioTracks().forEach(track => track.stop());
@@ -243,26 +396,20 @@ export const CallProvider = ({ children }) => {
         localVideoRef.current.srcObject = audioOnlyStream;
       }
       
-      // Update all peers
-      Object.values(peersRef.current).forEach(peer => {
-        try {
-          const sender = peer._pc.getSenders().find(s => s.track?.kind === 'video');
-          if (sender) {
-            sender.replaceTrack(null);
-          }
-        } catch (error) {
-          console.error('Error removing video track:', error);
-        }
-      });
+      // Close video producer
+      if (producersRef.current.video) {
+        producersRef.current.video.close();
+        delete producersRef.current.video;
+      }
       
       setVideoEnabled(false);
     }
     
-    if (socket) {
+    if (socket && roomId) {
       socket.emit('toggle-video', { 
         userId: socket.id, 
         videoEnabled: newVideoState,
-        roomId: Array.from(socket.rooms)[1] // Get current room ID
+        roomId
       });
     }
   };
@@ -271,16 +418,14 @@ export const CallProvider = ({ children }) => {
   useEffect(() => {
     if (!socket || !connected) return;
 
-    const handleCallStarted = ({ participants }) => {
+    const handleCallStarted = ({ participants, roomId }) => {
       console.log('Call started with participants:', participants);
-      setCallParticipants(participants.filter(p => p.id !== socket.id));
+      const otherParticipants = participants.filter(p => p.id !== socket.id);
+      setCallParticipants(otherParticipants);
       
-      // Create peer connections for existing participants
-      participants.forEach((participant) => {
-        if (participant.id !== socket.id && localStream && !peersRef.current[participant.id]) {
-          const peer = createPeer(participant.id, socket.id, localStream);
-          peersRef.current[participant.id] = peer;
-        }
+      // Consume media from existing participants
+      otherParticipants.forEach(async (participant) => {
+        await consumeMedia(participant.id);
       });
     };
 
@@ -295,9 +440,8 @@ export const CallProvider = ({ children }) => {
         return prev;
       });
       
-      if (userId !== socket.id && localStream && !peersRef.current[userId]) {
-        const peer = createPeer(userId, socket.id, localStream);
-        peersRef.current[userId] = peer;
+      if (userId !== socket.id) {
+        consumeMedia(userId);
       }
     };
 
@@ -305,7 +449,20 @@ export const CallProvider = ({ children }) => {
       console.log('User left call:', userId);
       
       setCallParticipants(prev => prev.filter(p => p.id !== userId));
-      removePeer(userId);
+      
+      // Close consumers for this user
+      Object.keys(consumersRef.current)
+        .filter(key => key.startsWith(`${userId}-`))
+        .forEach(key => {
+          consumersRef.current[key].close();
+          delete consumersRef.current[key];
+        });
+      
+      setRemoteStreams(prev => {
+        const newStreams = { ...prev };
+        delete newStreams[userId];
+        return newStreams;
+      });
     };
 
     const handleToggleMic = ({ userId, micEnabled }) => {
@@ -328,19 +485,23 @@ export const CallProvider = ({ children }) => {
     socket.on('call-started', handleCallStarted);
     socket.on('user-joined-call', handleUserJoined);
     socket.on('user-left-call', handleUserLeft);
-    socket.on('signal', handleSignal);
     socket.on('toggle-mic', handleToggleMic);
     socket.on('toggle-video', handleToggleVideo);
     socket.on('call-ended', handleCallEnded);
+    socket.on('new-producer', ({ userId }) => {
+      if (userId !== socket.id) {
+        consumeMedia(userId);
+      }
+    });
 
     return () => {
       socket.off('call-started', handleCallStarted);
       socket.off('user-joined-call', handleUserJoined);
       socket.off('user-left-call', handleUserLeft);
-      socket.off('signal', handleSignal);
       socket.off('toggle-mic', handleToggleMic);
       socket.off('toggle-video', handleToggleVideo);
       socket.off('call-ended', handleCallEnded);
+      socket.off('new-producer');
     };
   }, [socket, connected, localStream]);
 
@@ -350,18 +511,48 @@ export const CallProvider = ({ children }) => {
       if (localStream) {
         stopAllTracks(localStream);
       }
-      Object.values(peersRef.current).forEach(peer => {
+      
+      // Close all producers and consumers
+      Object.values(producersRef.current).forEach(producer => {
         try {
-          peer.destroy();
+          producer.close();
         } catch (error) {
-          console.error('Error destroying peer:', error);
+          console.error('Error closing producer:', error);
         }
       });
+      
+      Object.values(consumersRef.current).forEach(consumer => {
+        try {
+          consumer.close();
+        } catch (error) {
+          console.error('Error closing consumer:', error);
+        }
+      });
+      
+      // Close transports
+      if (sendTransportRef.current) {
+        sendTransportRef.current.close();
+      }
+      
+      if (recvTransportRef.current) {
+        recvTransportRef.current.close();
+      }
+      
+      // Clean up remote streams
       Object.values(remoteStreams).forEach(stream => {
         stopAllTracks(stream);
       });
     };
   }, []);
+
+  // Pagination functions
+  const nextPage = () => {
+    setCurrentPage(prev => Math.min(prev + 1, Math.ceil(callParticipants.length / PAGE_SIZE) - 1));
+  };
+
+  const prevPage = () => {
+    setCurrentPage(prev => Math.max(prev - 1, 0));
+  };
 
   const value = {
     localStream,
@@ -371,10 +562,14 @@ export const CallProvider = ({ children }) => {
     micEnabled,
     videoEnabled,
     localVideoRef,
+    currentPage,
+    PAGE_SIZE,
     startOrJoinCall,
     leaveCall,
     toggleMic,
     toggleVideo,
+    nextPage,
+    prevPage,
   };
 
   return <CallContext.Provider value={value}>{children}</CallContext.Provider>;

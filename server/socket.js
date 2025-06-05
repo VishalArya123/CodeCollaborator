@@ -1,22 +1,215 @@
-// Store active rooms and users
 const rooms = new Map();
+const mediasoup = require('mediasoup');
+let worker;
 
-/**
- * Sets up socket server with all event handlers
- * @param {Object} io - Socket.io server instance
- */
+async function initializeMediasoup() {
+  worker = await mediasoup.createWorker({
+    logLevel: 'warn',
+    rtcMinPort: 40000,
+    rtcMaxPort: 49999
+  });
+
+  worker.on('died', () => {
+    console.error('mediasoup worker died, exiting in 2 seconds...');
+    setTimeout(() => process.exit(1), 2000);
+  });
+
+  return worker;
+}
+
 function setupSocketServer(io) {
-  // Configure Socket.IO server with larger maxHttpBufferSize (50MB)
   io.engine.opts.maxHttpBufferSize = 50e6; // 50MB
+  const roomRouters = new Map();
 
   io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
-    // Join a room
+    socket.on('getRouterRtpCapabilities', async ({ roomId }, callback) => {
+      try {
+        if (!roomRouters.has(roomId)) {
+          const router = await worker.createRouter({
+            mediaCodecs: [
+              {
+                kind: 'audio',
+                mimeType: 'audio/opus',
+                clockRate: 48000,
+                channels: 2
+              },
+              {
+                kind: 'video',
+                mimeType: 'video/VP8',
+                clockRate: 90000,
+                parameters: {
+                  'x-google-start-bitrate': 1000
+                }
+              }
+            ]
+          });
+          roomRouters.set(roomId, router);
+        }
+        
+        callback({
+          rtpCapabilities: roomRouters.get(roomId).rtpCapabilities
+        });
+      } catch (error) {
+        callback({ error: error.message });
+      }
+    });
+
+    socket.on('createWebRtcTransport', async ({ roomId }, callback) => {
+      try {
+        const router = roomRouters.get(roomId);
+        if (!router) {
+          throw new Error('Router not found for room');
+        }
+
+        const transport = await router.createWebRtcTransport({
+          listenIps: [{ ip: '0.0.0.0', announcedIp: process.env.SERVER_IP }],
+          enableUdp: true,
+          enableTcp: true,
+          preferUdp: true,
+          initialAvailableOutgoingBitrate: 1000000
+        });
+
+        transport.on('dtlsstatechange', (dtlsState) => {
+          if (dtlsState === 'closed') {
+            transport.close();
+          }
+        });
+
+        callback({
+          params: {
+            id: transport.id,
+            iceParameters: transport.iceParameters,
+            iceCandidates: transport.iceCandidates,
+            dtlsParameters: transport.dtlsParameters
+          }
+        });
+      } catch (error) {
+        callback({ error: error.message });
+      }
+    });
+
+    socket.on('connectTransport', async ({ roomId, dtlsParameters, transportId }, callback) => {
+      try {
+        const router = roomRouters.get(roomId);
+        if (!router) {
+          throw new Error('Router not found for room');
+        }
+
+        // Find transport in router's transports
+        let transport;
+        for (const t of router._transports.values()) {
+          if (t.id === transportId) {
+            transport = t;
+            break;
+          }
+        }
+
+        if (!transport) {
+          throw new Error('Transport not found');
+        }
+
+        await transport.connect({ dtlsParameters });
+        callback({ success: true });
+      } catch (error) {
+        callback({ error: error.message });
+      }
+    });
+
+    socket.on('produce', async ({ roomId, transportId, kind, rtpParameters }, callback) => {
+      try {
+        const router = roomRouters.get(roomId);
+        if (!router) {
+          throw new Error('Router not found for room');
+        }
+
+        let transport;
+        for (const t of router._transports.values()) {
+          if (t.id === transportId) {
+            transport = t;
+            break;
+          }
+        }
+
+        if (!transport) {
+          throw new Error('Transport not found');
+        }
+
+        const producer = await transport.produce({
+          kind,
+          rtpParameters
+        });
+
+        callback({
+          id: producer.id,
+          kind: producer.kind
+        });
+
+        socket.to(roomId).emit('new-producer', {
+          producerId: producer.id,
+          userId: socket.id,
+          kind: producer.kind
+        });
+      } catch (error) {
+        callback({ error: error.message });
+      }
+    });
+
+    socket.on('getProducers', async ({ roomId, userId }, callback) => {
+      try {
+        const router = roomRouters.get(roomId);
+        if (!router) {
+          throw new Error('Router not found for room');
+        }
+
+        const producers = [];
+        for (const transport of router._transports.values()) {
+          for (const producer of transport._producers.values()) {
+            if (producer.appData && producer.appData.userId === userId) {
+              producers.push({
+                id: producer.id,
+                kind: producer.kind
+              });
+            }
+          }
+        }
+
+        callback({ producers });
+      } catch (error) {
+        callback({ error: error.message });
+      }
+    });
+
+    socket.on('resumeConsumer', async ({ roomId, consumerId }, callback) => {
+      try {
+        const router = roomRouters.get(roomId);
+        if (!router) {
+          throw new Error('Router not found for room');
+        }
+
+        let consumer;
+        for (const transport of router._transports.values()) {
+          if (transport._consumers.has(consumerId)) {
+            consumer = transport._consumers.get(consumerId);
+            break;
+          }
+        }
+
+        if (!consumer) {
+          throw new Error('Consumer not found');
+        }
+
+        await consumer.resume();
+        callback({ success: true });
+      } catch (error) {
+        callback({ error: error.message });
+      }
+    });
+
     socket.on('join-room', ({ roomId, username }) => {
       console.log(`User ${username} (${socket.id}) joining room: ${roomId}`);
       
-      // Leave any existing rooms first
       socket.rooms.forEach(room => {
         if (room !== socket.id) {
           socket.leave(room);
@@ -25,7 +218,6 @@ function setupSocketServer(io) {
 
       socket.join(roomId);
 
-      // Initialize room data if it doesn't exist
       if (!rooms.has(roomId)) {
         rooms.set(roomId, {
           users: [],
@@ -37,23 +229,20 @@ function setupSocketServer(io) {
             js: ''
           },
           activeUsers: 0,
-          callParticipants: [], // Track users in call
+          callParticipants: [],
           createdAt: new Date()
         });
       }
 
       const roomData = rooms.get(roomId);
-
-      // Check if user is already in the room (reconnection case)
       const existingUserIndex = roomData.users.findIndex(user => user.id === socket.id);
       
       if (existingUserIndex === -1) {
-        // Add new user to room
         const user = {
           id: socket.id,
           username,
           joinedAt: new Date(),
-          isInCall: false, // Initialize call status
+          isInCall: false,
           micEnabled: true,
           videoEnabled: true,
         };
@@ -61,7 +250,6 @@ function setupSocketServer(io) {
         roomData.users.push(user);
         roomData.activeUsers += 1;
 
-        // Create join message
         const joinMessage = {
           id: `${Date.now()}-${socket.id}`,
           sender: 'system',
@@ -70,24 +258,17 @@ function setupSocketServer(io) {
           roomId
         };
 
-        // Store the message
         roomData.messages.push(joinMessage);
-
-        // Notify other users about the new user
         socket.to(roomId).emit('user-joined', {
           user,
           users: roomData.users
         });
-
-        // Send system message to all users in room
         io.to(roomId).emit('chat-message', joinMessage);
       } else {
-        // User is reconnecting, update their socket ID
         roomData.users[existingUserIndex].id = socket.id;
         roomData.users[existingUserIndex].reconnectedAt = new Date();
       }
 
-      // Emit welcome message to the user (always send current state)
       socket.emit('room-joined', {
         roomId,
         users: roomData.users,
@@ -96,7 +277,6 @@ function setupSocketServer(io) {
         code: roomData.code
       });
 
-      // Send call status if a call is active
       if (roomData.callParticipants.length > 0) {
         socket.emit('call-started', {
           roomId,
@@ -107,7 +287,6 @@ function setupSocketServer(io) {
       console.log(`Room ${roomId} now has ${roomData.users.length} users`);
     });
 
-    // Handle request for room messages
     socket.on('get-room-messages', ({ roomId }) => {
       console.log(`User ${socket.id} requesting messages for room: ${roomId}`);
       
@@ -125,7 +304,6 @@ function setupSocketServer(io) {
       }
     });
 
-    // Handle request for room files
     socket.on('get-room-files', ({ roomId }) => {
       console.log(`User ${socket.id} requesting files for room: ${roomId}`);
       
@@ -137,7 +315,6 @@ function setupSocketServer(io) {
       }
     });
 
-    // Handle file upload
     socket.on('upload-files', ({ roomId, files }) => {
       console.log(`User ${socket.id} uploading ${files.length} files to room: ${roomId}`);
       
@@ -184,7 +361,6 @@ function setupSocketServer(io) {
       }
     });
 
-    // Handle file deletion
     socket.on('delete-file', ({ roomId, fileId }) => {
       console.log(`User ${socket.id} deleting file ${fileId} from room: ${roomId}`);
       
@@ -217,7 +393,6 @@ function setupSocketServer(io) {
       }
     });
 
-    // Handle code changes
     socket.on('code-change', ({ roomId, language, code }) => {
       if (rooms.has(roomId)) {
         const roomData = rooms.get(roomId);
@@ -230,7 +405,6 @@ function setupSocketServer(io) {
       }
     });
 
-    // Handle cursor position updates
     socket.on('cursor-position', ({ roomId, position, username }) => {
       socket.to(roomId).emit('cursor-update', {
         userId: socket.id,
@@ -239,7 +413,6 @@ function setupSocketServer(io) {
       });
     });
 
-    // Handle chat messages
     socket.on('send-message', ({ roomId, message, username, timestamp }) => {
       console.log(`Message from ${username} in room ${roomId}: ${message}`);
       
@@ -271,7 +444,6 @@ function setupSocketServer(io) {
       io.to(roomId).emit('chat-message', messageData);
     });
 
-    // Handle user typing in chat
     socket.on('typing', ({ roomId, username, isTyping }) => {
       socket.to(roomId).emit('user-typing', {
         userId: socket.id,
@@ -280,7 +452,6 @@ function setupSocketServer(io) {
       });
     });
 
-    // Handle call-related events
     socket.on('start-call', ({ roomId }) => {
       if (!rooms.has(roomId)) return;
       
@@ -304,10 +475,16 @@ function setupSocketServer(io) {
         roomData.callParticipants.push(participant);
         user.isInCall = true;
     
-        // Broadcast to all participants
         io.to(roomId).emit('call-started', {
           roomId,
           participants: roomData.callParticipants
+        });
+        
+        socket.to(roomId).emit('user-joined-call', {
+          userId: socket.id,
+          username: user.username,
+          micEnabled: true,
+          videoEnabled: true
         });
         
         console.log(`User ${user.username} joined call in room ${roomId}`);
@@ -317,16 +494,6 @@ function setupSocketServer(io) {
     socket.on('leave-call', ({ roomId }) => {
       console.log(`User ${socket.id} leaving call in room: ${roomId}`);
       handleCallLeaving(socket, roomId, io);
-    });
-
-    socket.on('signal', ({ userId, callerId, signal }) => {
-      console.log(`Relaying signal from ${callerId} to ${userId}`);
-      io.to(userId).emit('signal', { 
-        userId: callerId, 
-        callerId: socket.id, 
-        signal,
-        roomId: Array.from(socket.rooms)[1] // Include room ID
-      });
     });
 
     socket.on('toggle-mic', ({ userId, micEnabled, roomId }) => {
@@ -351,13 +518,11 @@ function setupSocketServer(io) {
       }
     });
 
-    // Handle explicit room leaving
     socket.on('leave-room', ({ roomId, username }) => {
       console.log(`User ${username} explicitly leaving room: ${roomId}`);
       handleUserLeaving(socket, roomId, username, io);
     });
 
-    // Handle disconnection
     socket.on('disconnect', (reason) => {
       console.log(`User disconnected: ${socket.id}, reason: ${reason}`);
 
@@ -387,14 +552,12 @@ function setupSocketServer(io) {
     });
   });
 
-  // Helper function to handle user leaving
   function handleUserLeaving(socket, roomId, username, io) {
     if (rooms.has(roomId)) {
       const roomData = rooms.get(roomId);
       const userIndex = roomData.users.findIndex(user => user.id === socket.id);
 
       if (userIndex !== -1) {
-        // Remove user from call participants if they are in the call
         if (roomData.callParticipants) {
           const participantIndex = roomData.callParticipants.findIndex(p => p.id === socket.id);
           if (participantIndex !== -1) {
@@ -404,7 +567,6 @@ function setupSocketServer(io) {
           }
         }
 
-        // Remove user from the room
         roomData.users.splice(userIndex, 1);
         roomData.activeUsers = Math.max(0, roomData.activeUsers - 1);
 
@@ -434,6 +596,7 @@ function setupSocketServer(io) {
           setTimeout(() => {
             if (rooms.has(roomId) && rooms.get(roomId).users.length === 0) {
               rooms.delete(roomId);
+              roomRouters.delete(roomId);
               console.log(`Room ${roomId} has been deleted (no users)`);
             }
           }, 60000);
@@ -442,7 +605,6 @@ function setupSocketServer(io) {
     }
   }
 
-  // Helper function to handle call leaving
   function handleCallLeaving(socket, roomId, io) {
     if (rooms.has(roomId)) {
       const roomData = rooms.get(roomId);
@@ -459,13 +621,13 @@ function setupSocketServer(io) {
     }
   }
 
-  // Periodic cleanup
   const cleanupInterval = setInterval(() => {
     let cleaned = 0;
     for (const [roomId, roomData] of rooms.entries()) {
       if (roomData.users.length === 0 && 
           (Date.now() - roomData.createdAt.getTime()) > 3600000) {
         rooms.delete(roomId);
+        roomRouters.delete(roomId);
         cleaned++;
       }
     }
@@ -483,7 +645,6 @@ function setupSocketServer(io) {
   });
 }
 
-// Optional: Function to get room statistics
 function getRoomStats() {
   const stats = {
     totalRooms: rooms.size,
@@ -508,5 +669,6 @@ function getRoomStats() {
 
 module.exports = { 
   setupSocketServer,
-  getRoomStats
+  getRoomStats,
+  initializeMediasoup
 };

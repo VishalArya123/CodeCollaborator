@@ -34,6 +34,7 @@ export const CallProvider = ({ children }) => {
   const audioAnalyserRef = useRef(null);
   const currentRoomRef = useRef(null);
   const peerConnectionsRef = useRef({});
+  const audioElementsRef = useRef({});
   
   const PAGE_SIZE = 4;
   const [currentPage, setCurrentPage] = useState(0);
@@ -60,23 +61,27 @@ export const CallProvider = ({ children }) => {
     });
   };
 
-  // FIXED: Fallback initialization without mediasoup
-  const initializeFallbackMode = async () => {
+  // FIXED: Enhanced fallback mode with actual WebRTC peer connections
+  const initializeFallbackMode = async (roomId) => {
     try {
-      console.log('Initializing fallback WebRTC mode');
+      console.log('Initializing fallback WebRTC mode for room:', roomId);
       setUsesFallbackMode(true);
       
-      // Just get user media for fallback mode
+      // Get user media
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
+          sampleRate: 48000,
         },
       });
 
       setLocalStream(stream);
       setupSpeakingDetection(stream);
+      
+      // Set up WebRTC peer connections for each participant
+      setupFallbackPeerConnections(roomId, stream);
       
       return true;
     } catch (error) {
@@ -85,25 +90,172 @@ export const CallProvider = ({ children }) => {
     }
   };
 
-  const initializeMediasoupMode = async (roomId) => {
-    try {
-      // Dynamically import mediasoup-client only when needed
-      const mediasoupClient = await import('mediasoup-client');
-      
-      if (deviceRef.current && deviceRef.current.loaded) {
-        return deviceRef.current;
+  // FIXED: Set up actual peer-to-peer connections for audio
+  const setupFallbackPeerConnections = (roomId, localStream) => {
+    console.log('Setting up WebRTC peer connections for fallback mode');
+    
+    // Listen for ICE candidates and offers from other peers
+    socket.on('ice-candidate', async ({ from, candidate }) => {
+      const peerConnection = peerConnectionsRef.current[from];
+      if (peerConnection && candidate) {
+        try {
+          await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (error) {
+          console.error('Error adding ICE candidate:', error);
+        }
       }
+    });
 
-      deviceRef.current = new mediasoupClient.Device();
+    socket.on('offer', async ({ from, offer }) => {
+      console.log('Received offer from:', from);
+      const peerConnection = createPeerConnection(from, roomId);
       
-      const routerRtpCapabilities = await socketRequest('getRouterRtpCapabilities', { roomId });
-      await deviceRef.current.load({ routerRtpCapabilities });
+      try {
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+        
+        // Add local stream
+        localStream.getTracks().forEach(track => {
+          peerConnection.addTrack(track, localStream);
+        });
+        
+        // Create answer
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        
+        socket.emit('answer', {
+          to: from,
+          answer: answer,
+          roomId
+        });
+      } catch (error) {
+        console.error('Error handling offer:', error);
+      }
+    });
+
+    socket.on('answer', async ({ from, answer }) => {
+      console.log('Received answer from:', from);
+      const peerConnection = peerConnectionsRef.current[from];
+      if (peerConnection) {
+        try {
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+        } catch (error) {
+          console.error('Error handling answer:', error);
+        }
+      }
+    });
+  };
+
+  // FIXED: Create individual peer connections for each user
+  const createPeerConnection = (userId, roomId) => {
+    const peerConnection = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+      ]
+    });
+
+    peerConnectionsRef.current[userId] = peerConnection;
+
+    // Handle ICE candidates
+    peerConnection.onicecandidate = (event) => {
+      if (event.candidate) {
+        socket.emit('ice-candidate', {
+          to: userId,
+          candidate: event.candidate,
+          roomId
+        });
+      }
+    };
+
+    // FIXED: Handle incoming audio streams
+    peerConnection.ontrack = (event) => {
+      console.log('Received remote track from:', userId);
+      const [remoteStream] = event.streams;
       
-      setUsesFallbackMode(false);
-      return deviceRef.current;
+      setRemoteStreams(prev => ({
+        ...prev,
+        [userId]: remoteStream
+      }));
+
+      // FIXED: Create audio element and play the stream
+      createAudioElement(userId, remoteStream);
+    };
+
+    peerConnection.onconnectionstatechange = () => {
+      console.log(`Peer connection with ${userId} state:`, peerConnection.connectionState);
+      if (peerConnection.connectionState === 'failed') {
+        // Attempt to reconnect
+        setTimeout(() => {
+          if (isInCall) {
+            initiatePeerConnection(userId, roomId);
+          }
+        }, 2000);
+      }
+    };
+
+    return peerConnection;
+  };
+
+  // FIXED: Create and manage audio elements for remote streams
+  const createAudioElement = (userId, stream) => {
+    // Remove existing audio element if it exists
+    if (audioElementsRef.current[userId]) {
+      audioElementsRef.current[userId].remove();
+    }
+
+    // Create new audio element
+    const audio = document.createElement('audio');
+    audio.srcObject = stream;
+    audio.autoplay = true;
+    audio.playsInline = true;
+    audio.volume = 1.0;
+    
+    // Hide the audio element but keep it in DOM for playback
+    audio.style.display = 'none';
+    document.body.appendChild(audio);
+    audioElementsRef.current[userId] = audio;
+
+    console.log('Audio element created for user:', userId);
+
+    // Handle audio play
+    audio.play().catch(error => {
+      console.error('Error playing audio:', error);
+      // Retry after user interaction
+      const playAudio = () => {
+        audio.play().then(() => {
+          document.removeEventListener('click', playAudio);
+          document.removeEventListener('touchstart', playAudio);
+        }).catch(console.error);
+      };
+      document.addEventListener('click', playAudio);
+      document.addEventListener('touchstart', playAudio);
+    });
+  };
+
+  // FIXED: Initiate peer connection when user joins
+  const initiatePeerConnection = async (userId, roomId) => {
+    if (!localStream || peerConnectionsRef.current[userId]) return;
+
+    console.log('Initiating peer connection with:', userId);
+    const peerConnection = createPeerConnection(userId, roomId);
+
+    try {
+      // Add local stream
+      localStream.getTracks().forEach(track => {
+        peerConnection.addTrack(track, localStream);
+      });
+
+      // Create offer
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+
+      socket.emit('offer', {
+        to: userId,
+        offer: offer,
+        roomId
+      });
     } catch (error) {
-      console.warn('Mediasoup initialization failed, switching to fallback mode:', error.message);
-      return await initializeFallbackMode();
+      console.error('Error creating offer:', error);
     }
   };
 
@@ -157,37 +309,14 @@ export const CallProvider = ({ children }) => {
     try {
       console.log('Starting/joining call in room:', roomId);
       
-      // Get user media first
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-
-      setLocalStream(stream);
-      setupSpeakingDetection(stream);
-
-      // Try to initialize mediasoup, fallback to simple WebRTC if it fails
-      try {
-        await initializeMediasoupMode(roomId);
-        console.log('Using advanced mediasoup mode');
-      } catch (error) {
-        console.log('Using fallback WebRTC mode');
-        setUsesFallbackMode(true);
-      }
+      // Always use fallback mode for now (since mediasoup is having issues)
+      await initializeFallbackMode(roomId);
       
       // Notify server about joining call
       socket.emit('start-call', { roomId });
       
       setIsInCall(true);
-      
-      if (usesFallbackMode) {
-        toast.success('Joined audio call (basic mode)');
-      } else {
-        toast.success('Joined audio call successfully!');
-      }
+      toast.success('Joined audio call successfully!');
       
       console.log('Successfully joined audio call');
     } catch (error) {
@@ -210,7 +339,7 @@ export const CallProvider = ({ children }) => {
         setLocalStream(null);
       }
       
-      // Close all peer connections in fallback mode
+      // Close all peer connections
       Object.values(peerConnectionsRef.current).forEach(pc => {
         try {
           pc.close();
@@ -220,34 +349,16 @@ export const CallProvider = ({ children }) => {
       });
       peerConnectionsRef.current = {};
       
-      // Clean up mediasoup resources if available
-      Object.values(producersRef.current).forEach(producer => {
+      // Remove all audio elements
+      Object.values(audioElementsRef.current).forEach(audio => {
         try {
-          producer.close();
+          audio.pause();
+          audio.remove();
         } catch (error) {
-          console.error('Error closing producer:', error);
+          console.error('Error removing audio element:', error);
         }
       });
-      producersRef.current = {};
-      
-      Object.values(consumersRef.current).forEach(consumer => {
-        try {
-          consumer.close();
-        } catch (error) {
-          console.error('Error closing consumer:', error);
-        }
-      });
-      consumersRef.current = {};
-      
-      if (sendTransportRef.current) {
-        sendTransportRef.current.close();
-        sendTransportRef.current = null;
-      }
-      
-      if (recvTransportRef.current) {
-        recvTransportRef.current.close();
-        recvTransportRef.current = null;
-      }
+      audioElementsRef.current = {};
       
       setRemoteStreams({});
       setCallParticipants([]);
@@ -306,18 +417,22 @@ export const CallProvider = ({ children }) => {
 
     const handleCallStarted = async ({ participants, roomId, mediasoupAvailable }) => {
       console.log('Call started with participants:', participants);
-      console.log('Mediasoup available:', mediasoupAvailable);
       
       const otherParticipants = participants.filter(p => p.id !== socket.id);
       setCallParticipants(otherParticipants);
       
-      if (!mediasoupAvailable) {
-        setUsesFallbackMode(true);
+      // FIXED: Initiate peer connections with existing participants
+      if (usesFallbackMode && localStream) {
+        otherParticipants.forEach(participant => {
+          setTimeout(() => {
+            initiatePeerConnection(participant.id, roomId);
+          }, 1000 + Math.random() * 2000); // Stagger connections
+        });
       }
     };
 
     const handleUserJoinedCall = async ({ userId, username, micEnabled, usingFallback }) => {
-      console.log('User joined call:', username, usingFallback ? '(fallback mode)' : '(advanced mode)');
+      console.log('User joined call:', username);
       setCallParticipants(prev => {
         const exists = prev.some(p => p.id === userId);
         if (!exists) {
@@ -325,6 +440,13 @@ export const CallProvider = ({ children }) => {
         }
         return prev;
       });
+      
+      // FIXED: Initiate peer connection with new user
+      if (usesFallbackMode && localStream && userId !== socket.id) {
+        setTimeout(() => {
+          initiatePeerConnection(userId, currentRoomRef.current);
+        }, 1000);
+      }
     };
 
     const handleUserLeftCall = ({ userId }) => {
@@ -343,14 +465,21 @@ export const CallProvider = ({ children }) => {
         return newSpeaking;
       });
 
-      // Close peer connection in fallback mode
+      // FIXED: Clean up peer connection and audio element
       if (peerConnectionsRef.current[userId]) {
         peerConnectionsRef.current[userId].close();
         delete peerConnectionsRef.current[userId];
       }
+
+      if (audioElementsRef.current[userId]) {
+        audioElementsRef.current[userId].pause();
+        audioElementsRef.current[userId].remove();
+        delete audioElementsRef.current[userId];
+      }
     };
 
     const handleToggleMic = ({ userId, micEnabled }) => {
+      console.log(`User ${userId} ${micEnabled ? 'unmuted' : 'muted'} microphone`);
       setCallParticipants(prev =>
         prev.map(p => p.id === userId ? { ...p, micEnabled } : p)
       );
@@ -373,7 +502,7 @@ export const CallProvider = ({ children }) => {
       socket.off('toggle-mic', handleToggleMic);
       socket.off('speaking-status', handleSpeakingStatus);
     };
-  }, [socket, connected]);
+  }, [socket, connected, usesFallbackMode, localStream]);
 
   useEffect(() => {
     return () => {

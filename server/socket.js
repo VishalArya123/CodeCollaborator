@@ -1,341 +1,80 @@
 const rooms = new Map();
-let mediasoup;
-let worker;
-let mediasoupAvailable = false;
-
-// Try to initialize mediasoup, but continue without it if it fails
-async function initializeMediasoup() {
-  try {
-    mediasoup = require('mediasoup');
-    
-    worker = await mediasoup.createWorker({
-      logLevel: 'warn',
-      rtcMinPort: 40000,
-      rtcMaxPort: 49999,
-    });
-
-    worker.on('died', () => {
-      console.error('mediasoup worker died, switching to fallback mode');
-      mediasoupAvailable = false;
-      worker = null;
-    });
-
-    mediasoupAvailable = true;
-    console.log('mediasoup worker initialized successfully');
-    return worker;
-  } catch (error) {
-    console.warn('Mediasoup initialization failed, using fallback mode:', error.message);
-    mediasoupAvailable = false;
-    worker = null;
-    return null;
-  }
-}
 
 function setupSocketServer(io) {
   io.engine.opts.maxHttpBufferSize = 100e6;
-  const roomRouters = new Map();
-
-  // Initialize mediasoup but don't fail if it doesn't work
-  initializeMediasoup().then((result) => {
-    if (result) {
-      console.log('Mediasoup worker ready for high-quality audio calls');
-    } else {
-      console.log('Running in fallback mode - basic WebRTC without mediasoup');
-    }
-  });
 
   io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
-    // FIXED: Fallback WebRTC implementation without mediasoup
+    // FIXED: WebRTC signaling for peer-to-peer audio
+    socket.on('offer', ({ to, offer, roomId }) => {
+      console.log(`Forwarding offer from ${socket.id} to ${to}`);
+      socket.to(to).emit('offer', {
+        from: socket.id,
+        offer,
+        roomId
+      });
+    });
+
+    socket.on('answer', ({ to, answer, roomId }) => {
+      console.log(`Forwarding answer from ${socket.id} to ${to}`);
+      socket.to(to).emit('answer', {
+        from: socket.id,
+        answer,
+        roomId
+      });
+    });
+
+    socket.on('ice-candidate', ({ to, candidate, roomId }) => {
+      console.log(`Forwarding ICE candidate from ${socket.id} to ${to}`);
+      socket.to(to).emit('ice-candidate', {
+        from: socket.id,
+        candidate,
+        roomId
+      });
+    });
+
+    // Fallback handlers (keeping existing mediasoup handlers for compatibility)
     socket.on('getRouterRtpCapabilities', async ({ roomId }, callback) => {
-      console.log(`Getting router RTP capabilities for room: ${roomId}`);
-      
-      if (!mediasoupAvailable || !worker) {
-        console.log('Mediasoup not available, using fallback WebRTC capabilities');
-        
-        // Return basic WebRTC capabilities that work with standard browsers
-        const fallbackCapabilities = {
-          codecs: [
-            {
-              kind: 'audio',
-              mimeType: 'audio/opus',
-              clockRate: 48000,
-              channels: 2,
-              parameters: {},
-              rtcpFeedback: []
-            },
-            {
-              kind: 'audio',
-              mimeType: 'audio/PCMU',
-              clockRate: 8000,
-              channels: 1,
-              parameters: {},
-              rtcpFeedback: []
-            }
-          ],
-          headerExtensions: [
-            {
-              kind: 'audio',
-              uri: 'urn:ietf:params:rtp-hdrext:ssrc-audio-level',
-              preferredId: 1
-            }
-          ]
-        };
-        
-        callback({ rtpCapabilities: fallbackCapabilities });
-        return;
-      }
-      
-      try {
-        if (!roomRouters.has(roomId)) {
-          console.log(`Creating new router for room: ${roomId}`);
-          
-          const router = await worker.createRouter({
-            mediaCodecs: [
-              {
-                kind: 'audio',
-                mimeType: 'audio/opus',
-                clockRate: 48000,
-                channels: 2,
-                parameters: {
-                  'sprop-stereo': 1
-                }
-              },
-              {
-                kind: 'audio',
-                mimeType: 'audio/PCMU',
-                clockRate: 8000,
-              }
-            ],
-          });
-          
-          router.transports = new Map();
-          router.producers = new Map();
-          router.consumers = new Map();
-          roomRouters.set(roomId, router);
-          console.log(`Router created successfully for room: ${roomId}`);
-        }
-        
-        const router = roomRouters.get(roomId);
-        callback({ rtpCapabilities: router.rtpCapabilities });
-        
-      } catch (error) {
-        console.error('Error in getRouterRtpCapabilities:', error);
-        callback({ error: error.message });
-      }
+      console.log('Using fallback WebRTC mode');
+      const fallbackCapabilities = {
+        codecs: [
+          {
+            kind: 'audio',
+            mimeType: 'audio/opus',
+            clockRate: 48000,
+            channels: 2,
+            parameters: {},
+            rtcpFeedback: []
+          }
+        ],
+        headerExtensions: []
+      };
+      callback({ rtpCapabilities: fallbackCapabilities });
     });
 
-    // FIXED: Fallback transport creation
     socket.on('createWebRtcTransport', async ({ roomId }, callback) => {
-      console.log(`Creating WebRTC transport for room: ${roomId}`);
-      
-      if (!mediasoupAvailable || !worker) {
-        console.log('Using fallback transport (simple peer connection)');
-        
-        // Return mock transport data for fallback mode
-        const fallbackTransport = {
-          id: `fallback-${Date.now()}-${Math.random()}`,
-          iceParameters: {
-            usernameFragment: 'fallback',
-            password: 'fallback-password'
-          },
-          iceCandidates: [],
-          dtlsParameters: {
-            fingerprints: [{
-              algorithm: 'sha-256',
-              value: 'fallback-fingerprint'
-            }],
-            role: 'auto'
-          }
-        };
-        
-        callback(fallbackTransport);
-        return;
-      }
-      
-      try {
-        const router = roomRouters.get(roomId);
-        if (!router) {
-          throw new Error('Router not found for room');
+      const fallbackTransport = {
+        id: `fallback-${Date.now()}-${Math.random()}`,
+        iceParameters: { usernameFragment: 'fallback', password: 'fallback-password' },
+        iceCandidates: [],
+        dtlsParameters: {
+          fingerprints: [{ algorithm: 'sha-256', value: 'fallback-fingerprint' }],
+          role: 'auto'
         }
-
-        const transport = await router.createWebRtcTransport({
-          listenIps: [
-            { 
-              ip: '0.0.0.0', 
-              announcedIp: process.env.MEDIASOUP_ANNOUNCED_IP || '127.0.0.1' 
-            }
-          ],
-          enableUdp: true,
-          enableTcp: true,
-          preferUdp: true,
-        });
-
-        router.transports.set(transport.id, transport);
-
-        transport.on('dtlsstatechange', (dtlsState) => {
-          if (dtlsState === 'closed') {
-            transport.close();
-            router.transports.delete(transport.id);
-          }
-        });
-
-        callback({
-          id: transport.id,
-          iceParameters: transport.iceParameters,
-          iceCandidates: transport.iceCandidates,
-          dtlsParameters: transport.dtlsParameters,
-        });
-      } catch (error) {
-        console.error('Error in createWebRtcTransport:', error);
-        callback({ error: error.message });
-      }
+      };
+      callback(fallbackTransport);
     });
 
-    // FIXED: Fallback connect transport
-    socket.on('connectTransport', async ({ roomId, transportId, dtlsParameters }, callback) => {
-      console.log(`Connecting transport ${transportId} for room: ${roomId}`);
-      
-      if (!mediasoupAvailable || !worker) {
-        console.log('Fallback mode: simulating transport connection');
-        callback({ success: true });
-        return;
-      }
-      
-      try {
-        const router = roomRouters.get(roomId);
-        if (!router) {
-          throw new Error('Router not found for room');
-        }
-        
-        const transport = router.transports.get(transportId);
-        if (!transport) {
-          throw new Error('Transport not found');
-        }
-        
-        await transport.connect({ dtlsParameters });
-        callback({ success: true });
-      } catch (error) {
-        console.error('Error in connectTransport:', error);
-        callback({ error: error.message });
-      }
+    socket.on('connectTransport', async (data, callback) => {
+      callback({ success: true });
     });
 
-    // FIXED: Fallback produce
-    socket.on('produce', async ({ roomId, transportId, kind, rtpParameters }, callback) => {
-      console.log(`Producing ${kind} media for room: ${roomId}`);
-      
-      if (!mediasoupAvailable || !worker) {
-        console.log('Fallback mode: simulating media production');
-        const mockProducerId = `fallback-producer-${Date.now()}-${Math.random()}`;
-        callback({ id: mockProducerId });
-        
-        // Notify other users in fallback mode
-        socket.to(roomId).emit('new-producer', { 
-          userId: socket.id,
-          producerId: mockProducerId,
-          kind: kind
-        });
-        return;
-      }
-      
-      try {
-        const router = roomRouters.get(roomId);
-        if (!router) {
-          throw new Error('Router not found for room');
-        }
-        
-        const transport = router.transports.get(transportId);
-        if (!transport) {
-          throw new Error('Transport not found');
-        }
-        
-        const producer = await transport.produce({
-          kind,
-          rtpParameters,
-        });
-        
-        producer.appData = { 
-          userId: socket.id,
-          roomId: roomId,
-          transportId: transportId
-        };
-        
-        router.producers.set(producer.id, producer);
-        
-        callback({ id: producer.id });
-        
-        socket.to(roomId).emit('new-producer', { 
-          userId: socket.id,
-          producerId: producer.id,
-          kind: producer.kind
-        });
-        
-      } catch (error) {
-        console.error('Error in produce:', error);
-        callback({ error: error.message });
-      }
+    socket.on('produce', async (data, callback) => {
+      const mockProducerId = `fallback-producer-${Date.now()}`;
+      callback({ id: mockProducerId });
     });
 
-    socket.on('getProducers', async ({ userId, roomId }, callback) => {
-      if (!mediasoupAvailable || !worker) {
-        console.log('Fallback mode: returning empty producers list');
-        callback({ producers: [] });
-        return;
-      }
-      
-      try {
-        const router = roomRouters.get(roomId);
-        if (!router) {
-          callback({ producers: [] });
-          return;
-        }
-        
-        const producers = [];
-        for (const producer of router.producers.values()) {
-          if (producer.appData.userId === userId && producer.kind === 'audio') {
-            producers.push({
-              id: producer.id,
-              kind: producer.kind,
-            });
-          }
-        }
-        
-        callback({ producers });
-      } catch (error) {
-        console.error('Error in getProducers:', error);
-        callback({ error: error.message });
-      }
-    });
-
-    socket.on('resumeConsumer', async ({ roomId, consumerId }, callback) => {
-      if (!mediasoupAvailable || !worker) {
-        console.log('Fallback mode: simulating consumer resume');
-        callback({ success: true });
-        return;
-      }
-      
-      try {
-        const router = roomRouters.get(roomId);
-        if (!router) {
-          throw new Error('Router not found for room');
-        }
-        
-        const consumer = router.consumers.get(consumerId);
-        if (!consumer) {
-          throw new Error('Consumer not found');
-        }
-        
-        await consumer.resume();
-        callback({ success: true });
-      } catch (error) {
-        console.error('Error in resumeConsumer:', error);
-        callback({ error: error.message });
-      }
-    });
-
-    // Enhanced join-room handler
     socket.on('join-room', ({ roomId, username }) => {
       console.log(`User ${username} (${socket.id}) joining room: ${roomId}`);
       
@@ -411,15 +150,13 @@ function setupSocketServer(io) {
         messages: roomData.messages.slice(-100),
         files: roomData.files,
         code: roomData.code,
-        mediasoupAvailable, // Send mediasoup status to client
       });
 
       console.log(`Room ${roomId} now has ${roomData.users.length} users`);
     });
 
-    // Enhanced call management
     socket.on('start-call', ({ roomId }) => {
-      console.log(`User ${socket.id} starting call in room: ${roomId} (mediasoup: ${mediasoupAvailable})`);
+      console.log(`User ${socket.id} starting call in room: ${roomId}`);
       
       if (!rooms.has(roomId)) return;
       
@@ -439,8 +176,7 @@ function setupSocketServer(io) {
           username: user.username,
           micEnabled: true,
           isSpeaking: false,
-          joinedAt: new Date(),
-          usingFallback: !mediasoupAvailable
+          joinedAt: new Date()
         };
         
         roomData.callParticipants.push(participant);
@@ -451,21 +187,18 @@ function setupSocketServer(io) {
         io.to(roomId).emit('call-started', {
           roomId,
           participants: roomData.callParticipants,
-          mediasoupAvailable,
         });
 
         socket.to(roomId).emit('user-joined-call', {
           userId: socket.id,
           username: user.username,
           micEnabled: true,
-          usingFallback: !mediasoupAvailable
         });
 
-        // Send call notification
         const callMessage = {
           id: `${Date.now()}-${socket.id}`,
           sender: 'system',
-          message: `${user.username} joined the audio call${!mediasoupAvailable ? ' (basic mode)' : ''}`,
+          message: `${user.username} joined the audio call`,
           timestamp: new Date().toISOString(),
           roomId,
           type: 'call-join'
@@ -476,7 +209,43 @@ function setupSocketServer(io) {
       }
     });
 
-    // Other handlers remain the same...
+    // FIXED: Enhanced toggle-mic handler with better tracking
+    socket.on('toggle-mic', ({ userId, micEnabled, roomId }) => {
+      console.log(`User ${userId} ${micEnabled ? 'unmuted' : 'muted'} in room ${roomId}`);
+      
+      if (rooms.has(roomId)) {
+        const roomData = rooms.get(roomId);
+        
+        // Update user state
+        const user = roomData.users.find(u => u.id === userId);
+        if (user) {
+          user.micEnabled = micEnabled;
+        }
+        
+        // Update call participant state
+        const participant = roomData.callParticipants?.find(p => p.id === userId);
+        if (participant) {
+          participant.micEnabled = micEnabled;
+        }
+        
+        // Broadcast to all users in room
+        io.to(roomId).emit('toggle-mic', { userId, micEnabled });
+      }
+    });
+
+    socket.on('speaking-status', ({ userId, isSpeaking, roomId }) => {
+      if (rooms.has(roomId)) {
+        const roomData = rooms.get(roomId);
+        const participant = roomData.callParticipants?.find(p => p.id === userId);
+        if (participant) {
+          participant.isSpeaking = isSpeaking;
+        }
+        
+        socket.to(roomId).emit('speaking-status', { userId, isSpeaking });
+      }
+    });
+
+    // Other existing handlers...
     socket.on('send-message', ({ roomId, message, username, timestamp, replyTo, type = 'text' }) => {
       if (!rooms.has(roomId) || !message?.trim()) return;
 

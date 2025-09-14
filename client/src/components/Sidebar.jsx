@@ -7,9 +7,7 @@ import {
   FaChevronLeft,
   FaChevronRight,
   FaCog,
-  FaBell,
-  FaExpand,
-  FaCompress
+  FaBell
 } from 'react-icons/fa';
 import UserList from './UserList';
 import Chat from './Chat';
@@ -110,14 +108,15 @@ const Sidebar = ({ users, roomId, username }) => {
         />
       )}
 
-      <div className="p-4 bg-gradient-to-r from-slate-50 to-slate-100 dark:from-slate-800 dark:to-slate-700 border-b border-slate-200 dark:border-slate-600">
+      {/* FIXED: Header - reduced padding to save space */}
+      <div className="p-3 bg-gradient-to-r from-slate-50 to-slate-100 dark:from-slate-800 dark:to-slate-700 border-b border-slate-200 dark:border-slate-600 flex-shrink-0">
         <div className="flex items-center justify-between">
           {!isCollapsed && (
             <div>
               <h2 className="text-lg font-semibold text-slate-800 dark:text-slate-200">
                 Workspace
               </h2>
-              <p className="text-sm text-slate-500 dark:text-slate-400">
+              <p className="text-xs text-slate-500 dark:text-slate-400">
                 Collaborate in real-time
               </p>
             </div>
@@ -137,10 +136,11 @@ const Sidebar = ({ users, roomId, username }) => {
         </div>
       </div>
 
-      <div className={`border-b border-slate-200 dark:border-slate-700 ${
-        isCollapsed ? 'p-2' : 'p-4'
+      {/* FIXED: Tab Navigation - reduced padding and made more compact */}
+      <div className={`border-b border-slate-200 dark:border-slate-700 flex-shrink-0 ${
+        isCollapsed ? 'p-1' : 'p-2'
       }`}>
-        <div className={`${isCollapsed ? 'space-y-2' : 'grid grid-cols-2 gap-2'}`}>
+        <div className={`${isCollapsed ? 'space-y-1' : 'grid grid-cols-2 gap-1'}`}>
           {tabs.map((tab) => {
             const Icon = tab.icon;
             const isActive = activeTab === tab.id;
@@ -149,21 +149,21 @@ const Sidebar = ({ users, roomId, username }) => {
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
-                className={`relative flex items-center justify-center p-3 rounded-xl transition-all duration-200 ${
+                className={`relative flex items-center justify-center p-2 rounded-lg transition-all duration-200 ${
                   isActive
                     ? 'bg-gradient-to-r from-indigo-500 to-purple-600 text-white shadow-lg transform scale-105'
                     : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
-                } ${isCollapsed ? 'w-12 h-12' : 'h-16'}`}
+                } ${isCollapsed ? 'w-10 h-10' : 'h-12'}`}
                 title={tab.label}
               >
                 <div className={`flex items-center ${isCollapsed ? 'justify-center' : 'justify-start w-full'}`}>
-                  <Icon className={`${isCollapsed ? 'w-5 h-5' : 'w-6 h-6'} ${
+                  <Icon className={`${isCollapsed ? 'w-4 h-4' : 'w-5 h-5'} ${
                     isActive ? 'text-white' : tab.color
                   }`} />
                   
                   {!isCollapsed && (
-                    <div className="ml-3 flex-1">
-                      <div className={`font-semibold text-sm ${
+                    <div className="ml-2 flex-1">
+                      <div className={`font-semibold text-xs ${
                         isActive ? 'text-white' : 'text-slate-700 dark:text-slate-300'
                       }`}>
                         {tab.label}
@@ -185,15 +185,11 @@ const Sidebar = ({ users, roomId, username }) => {
                 </div>
 
                 {tab.count > 0 && (tab.id === 'chat' || tab.id === 'files') && (
-                  <div className={`absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full min-w-[20px] h-5 flex items-center justify-center font-bold ${
-                    isCollapsed ? 'text-xs px-1' : 'px-2'
+                  <div className={`absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full min-w-[16px] h-4 flex items-center justify-center font-bold ${
+                    isCollapsed ? 'text-xs px-1' : 'px-1.5'
                   }`}>
                     {tab.count > 99 ? '99+' : tab.count}
                   </div>
-                )}
-
-                {isActive && !isCollapsed && (
-                  <div className="absolute bottom-1 left-1/2 transform -translate-x-1/2 w-6 h-1 bg-white rounded-full opacity-80"></div>
                 )}
               </button>
             );
@@ -201,46 +197,49 @@ const Sidebar = ({ users, roomId, username }) => {
         </div>
       </div>
 
-      <div className="flex-1 overflow-hidden flex flex-col">
+      {/* FIXED: Content Area - Made properly scrollable with flex layout */}
+      <div className="flex-1 flex flex-col overflow-hidden min-h-0">
         {!isCollapsed && (
           <>
-            <div className="p-4 border-b border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-slate-800">
+            {/* FIXED: Section Header - more compact */}
+            <div className="p-2 border-b border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-slate-800 flex-shrink-0">
               <div className="flex items-center justify-between">
                 <div className="flex items-center space-x-2">
                   {activeTabData && (
                     <>
-                      <activeTabData.icon className={`w-5 h-5 ${activeTabData.color}`} />
-                      <h3 className="font-semibold text-slate-800 dark:text-slate-200">
+                      <activeTabData.icon className={`w-4 h-4 ${activeTabData.color}`} />
+                      <h3 className="font-semibold text-sm text-slate-800 dark:text-slate-200">
                         {activeTabData.label}
                       </h3>
                     </>
                   )}
                 </div>
                 
-                <div className="flex items-center space-x-2">
+                <div className="flex items-center space-x-1">
                   {activeTab === 'chat' && (
                     <button
                       onClick={() => setNotifications(prev => ({ ...prev, chat: 0 }))}
-                      className="p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 rounded-md transition-colors"
+                      className="p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 rounded transition-colors"
                       title="Mark as read"
                     >
-                      <FaBell className="w-4 h-4" />
+                      <FaBell className="w-3 h-3" />
                     </button>
                   )}
                   
                   <button
-                    className="p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 rounded-md transition-colors"
+                    className="p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 rounded transition-colors"
                     title="Settings"
                   >
-                    <FaCog className="w-4 h-4" />
+                    <FaCog className="w-3 h-3" />
                   </button>
                 </div>
               </div>
             </div>
 
-            <div className="flex-1 overflow-hidden">
+            {/* FIXED: Scrollable Content Area */}
+            <div className="flex-1 overflow-hidden min-h-0">
               {activeTab === 'users' && (
-                <div className="h-full overflow-y-auto">
+                <div className="h-full">
                   <UserList users={users} currentUsername={username} />
                 </div>
               )}
@@ -258,7 +257,7 @@ const Sidebar = ({ users, roomId, username }) => {
               )}
               
               {activeTab === 'files' && (
-                <div className="h-full overflow-y-auto">
+                <div className="h-full">
                   <FileManager roomId={roomId} username={username} />
                 </div>
               )}
@@ -266,6 +265,7 @@ const Sidebar = ({ users, roomId, username }) => {
           </>
         )}
 
+        {/* Collapsed State */}
         {isCollapsed && (
           <div className="flex-1 flex flex-col items-center justify-center p-2 space-y-4">
             <div className="w-8 h-8 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-lg flex items-center justify-center">
@@ -285,10 +285,11 @@ const Sidebar = ({ users, roomId, username }) => {
         )}
       </div>
 
+      {/* FIXED: Footer - more compact */}
       {!isCollapsed && (
-        <div className="p-4 border-t border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-slate-800">
+        <div className="p-2 border-t border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-slate-800 flex-shrink-0">
           <div className="flex items-center justify-between">
-            <div className="text-sm text-slate-600 dark:text-slate-400">
+            <div className="text-xs text-slate-600 dark:text-slate-400">
               Room: <span className="font-mono text-xs">{roomId.substring(0, 8)}...</span>
             </div>
             
@@ -309,6 +310,7 @@ const Sidebar = ({ users, roomId, username }) => {
         </div>
       )}
 
+      {/* Collapsed State Notifications */}
       {isCollapsed && (
         <div className="absolute bottom-4 left-4 right-4 space-y-2">
           {users.filter(u => u.isInCall).length > 0 && (

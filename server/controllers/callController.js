@@ -1,7 +1,7 @@
 const rooms = new Map(); // Assuming rooms are shared from socket.js
 
 /**
- * Check if a call is active in a room
+ * Check if an audio call is active in a room
  * @param {Object} req - Express request object
  * @param {Object} res - Express response object
  */

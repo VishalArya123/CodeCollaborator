@@ -1,467 +1,500 @@
 import { createContext, useContext, useEffect, useRef, useState } from 'react';
 import { useSocket } from './SocketContext';
 import * as mediasoupClient from 'mediasoup-client';
-
-// Utility for Socket.IO request-response pattern
-const socketRequest = (socket, event, data) => {
-  return new Promise((resolve, reject) => {
-    socket.emit(event, data, (response) => {
-      if (response.error) {
-        reject(new Error(response.error));
-      } else {
-        resolve(response);
-      }
-    });
-  });
-};
+import toast from 'react-hot-toast';
 
 const CallContext = createContext();
 
 export const useCall = () => {
-  return useContext(CallContext);
+  const context = useContext(CallContext);
+  if (!context) {
+    throw new Error('useCall must be used within a CallProvider');
+  }
+  return context;
 };
 
 export const CallProvider = ({ children }) => {
   const { socket, connected } = useSocket();
+  
+  // Call state management
   const [localStream, setLocalStream] = useState(null);
   const [remoteStreams, setRemoteStreams] = useState({});
   const [callParticipants, setCallParticipants] = useState([]);
   const [isInCall, setIsInCall] = useState(false);
   const [micEnabled, setMicEnabled] = useState(true);
-  const [videoEnabled, setVideoEnabled] = useState(true);
-  const [currentPage, setCurrentPage] = useState(0);
-  const peersRef = useRef({});
-  const localVideoRef = useRef(null);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [speakingUsers, setSpeakingUsers] = useState({});
+  const [callError, setCallError] = useState(null);
+  const [isInitializing, setIsInitializing] = useState(false);
+  
+  // Refs for mediasoup
   const deviceRef = useRef(null);
   const sendTransportRef = useRef(null);
   const recvTransportRef = useRef(null);
   const producersRef = useRef({});
   const consumersRef = useRef({});
-  const PAGE_SIZE = 4; // Show 4 participants per page
+  const audioAnalyserRef = useRef(null);
+  const currentRoomRef = useRef(null);
+  
+  // Pagination for participants
+  const PAGE_SIZE = 4;
+  const [currentPage, setCurrentPage] = useState(0);
+
+  // Utility function for socket requests with timeout
+  const socketRequest = (event, data, timeout = 10000) => {
+    return new Promise((resolve, reject) => {
+      if (!socket || !connected) {
+        reject(new Error('Socket not connected'));
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        reject(new Error(`Socket request timeout: ${event}`));
+      }, timeout);
+
+      socket.emit(event, data, (response) => {
+        clearTimeout(timer);
+        if (response?.error) {
+          reject(new Error(response.error));
+        } else {
+          resolve(response);
+        }
+      });
+    });
+  };
 
   // Initialize mediasoup device
-  const initializeDevice = async () => {
-    if (!socket || !connected) return;
+  const initializeDevice = async (roomId) => {
     try {
+      if (deviceRef.current && deviceRef.current.loaded) {
+        console.log('Device already initialized');
+        return deviceRef.current;
+      }
+
       deviceRef.current = new mediasoupClient.Device();
       
-      const routerRtpCapabilities = await socketRequest(socket, 'getRouterRtpCapabilities', { 
-        roomId: Array.from(socket.rooms || new Set()).find(room => room !== socket.id)
-      });
-      
+      const routerRtpCapabilities = await socketRequest('getRouterRtpCapabilities', { roomId });
       await deviceRef.current.load({ routerRtpCapabilities });
+      
+      console.log('Mediasoup device initialized successfully');
+      return deviceRef.current;
     } catch (error) {
       console.error('Error initializing mediasoup device:', error);
+      setCallError('Failed to initialize audio device. Please refresh and try again.');
+      throw error;
     }
   };
 
-  // Create transports
-  const createTransports = async () => {
-    if (!socket || !connected) return;
+  // Create WebRTC transports
+  const createTransports = async (roomId) => {
     try {
-      const roomId = Array.from(socket.rooms || new Set()).find(room => room !== socket.id);
-      if (!roomId) throw new Error('No room joined');
-
       // Create send transport
-      const sendTransportData = await socketRequest(socket, 'createWebRtcTransport', { roomId });
-      
+      const sendTransportData = await socketRequest('createWebRtcTransport', { roomId });
       sendTransportRef.current = deviceRef.current.createSendTransport(sendTransportData);
-      
+
       sendTransportRef.current.on('connect', async ({ dtlsParameters }, callback, errback) => {
         try {
-          await socketRequest(socket, 'connectTransport', {
+          await socketRequest('connectTransport', {
             transportId: sendTransportRef.current.id,
             dtlsParameters,
-            roomId
+            roomId,
           });
           callback();
         } catch (error) {
+          console.error('Send transport connect error:', error);
           errback(error);
         }
       });
-      
+
       sendTransportRef.current.on('produce', async ({ kind, rtpParameters }, callback, errback) => {
         try {
-          const { id } = await socketRequest(socket, 'produce', {
+          const { id } = await socketRequest('produce', {
             transportId: sendTransportRef.current.id,
             kind,
             rtpParameters,
-            roomId
+            roomId,
           });
           callback({ id });
         } catch (error) {
+          console.error('Produce error:', error);
           errback(error);
         }
       });
 
       // Create receive transport
-      const recvTransportData = await socketRequest(socket, 'createWebRtcTransport', { roomId });
-      
+      const recvTransportData = await socketRequest('createWebRtcTransport', { roomId });
       recvTransportRef.current = deviceRef.current.createRecvTransport(recvTransportData);
-      
+
       recvTransportRef.current.on('connect', async ({ dtlsParameters }, callback, errback) => {
         try {
-          await socketRequest(socket, 'connectTransport', {
+          await socketRequest('connectTransport', {
             transportId: recvTransportRef.current.id,
             dtlsParameters,
-            roomId
+            roomId,
           });
           callback();
         } catch (error) {
+          console.error('Recv transport connect error:', error);
           errback(error);
         }
       });
+
+      console.log('Transports created successfully');
     } catch (error) {
       console.error('Error creating transports:', error);
-    }
-  };
-
-  // Produce local media
-  const produceMedia = async () => {
-    if (!localStream || !sendTransportRef.current) return;
-    
-    try {
-      // Produce audio
-      if (localStream.getAudioTracks().length > 0) {
-        const audioTrack = localStream.getAudioTracks()[0];
-        const audioProducer = await sendTransportRef.current.produce({
-          track: audioTrack,
-          codecOptions: {
-            opusStereo: true,
-            opusDtx: true
-          }
-        });
-        producersRef.current.audio = audioProducer;
-      }
-      
-      // Produce video
-      if (localStream.getVideoTracks().length > 0) {
-        const videoTrack = localStream.getVideoTracks()[0];
-        const videoProducer = await sendTransportRef.current.produce({
-          track: videoTrack,
-          encodings: [
-            { maxBitrate: 1000000 },
-            { maxBitrate: 500000 },
-            { maxBitrate: 250000 }
-          ],
-          codecOptions: {
-            videoGoogleStartBitrate: 1000
-          }
-        });
-        producersRef.current.video = videoProducer;
-      }
-    } catch (error) {
-      console.error('Error producing media:', error);
-    }
-  };
-
-  // Consume remote media
-  const consumeMedia = async (userId) => {
-    if (!recvTransportRef.current || !socket || !connected) return;
-    
-    try {
-      const roomId = Array.from(socket.rooms || new Set()).find(room => room !== socket.id);
-      if (!roomId) throw new Error('No room joined');
-
-      const { producers } = await socketRequest(socket, 'getProducers', { userId, roomId });
-      
-      const stream = new MediaStream();
-      
-      for (const producer of producers) {
-        const { id, kind } = producer;
-        
-        const consumer = await recvTransportRef.current.consume({
-          producerId: id,
-          rtpCapabilities: deviceRef.current.rtpCapabilities,
-          paused: kind === 'video'
-        });
-        
-        consumersRef.current[`${userId}-${kind}`] = consumer;
-        
-        stream.addTrack(consumer.track);
-        
-        if (kind === 'video') {
-          await socketRequest(socket, 'resumeConsumer', { consumerId: consumer.id, roomId });
-        }
-      }
-      
-      setRemoteStreams(prev => ({
-        ...prev,
-        [userId]: stream
-      }));
-    } catch (error) {
-      console.error('Error consuming media:', error);
+      setCallError('Failed to set up audio connection. Please try again.');
+      throw error;
     }
   };
 
   // Initialize local media stream
   const initializeMedia = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: true,
-      });
-      setLocalStream(stream);
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
+      if (localStream) {
+        console.log('Media stream already exists');
+        return localStream;
       }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: 48000,
+          channelCount: 2,
+        },
+      });
+
+      setLocalStream(stream);
+      setupSpeakingDetection(stream);
+      
+      console.log('Local media stream initialized');
       return stream;
     } catch (error) {
-      console.error('Error accessing media devices:', error);
-      return null;
+      console.error('Error accessing audio devices:', error);
+      setCallError('Failed to access microphone. Please check permissions.');
+      throw error;
     }
   };
 
-  // Properly stop all media tracks
-  const stopAllTracks = (stream) => {
-    if (stream) {
-      stream.getTracks().forEach(track => {
-        track.stop();
-      });
-    }
-  };
-
-  // Start or join a call
-  const startOrJoinCall = async (roomId) => {
-    if (!socket || !connected || isInCall) return;
-  
+  // Set up speaking detection
+  const setupSpeakingDetection = (stream) => {
     try {
-      let stream = localStream;
-      if (!stream) {
-        stream = await initializeMedia();
-        if (!stream) return;
-      }
-  
-      setIsInCall(true);
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioContext.createMediaStreamSource(stream);
+      audioAnalyserRef.current = audioContext.createAnalyser();
+      audioAnalyserRef.current.fftSize = 512;
+      audioAnalyserRef.current.smoothingTimeConstant = 0.8;
+      source.connect(audioAnalyserRef.current);
+
+      const dataArray = new Uint8Array(audioAnalyserRef.current.frequencyBinCount);
       
-      // Initialize mediasoup
-      await initializeDevice();
-      await createTransports();
+      const checkSpeaking = () => {
+        if (!audioAnalyserRef.current) return;
+        
+        audioAnalyserRef.current.getByteFrequencyData(dataArray);
+        const average = dataArray.reduce((sum, val) => sum + val) / dataArray.length;
+        const isCurrentlySpeaking = average > 25; // Adjusted threshold
+        
+        if (isCurrentlySpeaking !== isSpeaking) {
+          setIsSpeaking(isCurrentlySpeaking);
+          if (socket && currentRoomRef.current) {
+            socket.emit('speaking-status', {
+              userId: socket.id,
+              isSpeaking: isCurrentlySpeaking,
+              roomId: currentRoomRef.current,
+            });
+          }
+        }
+        
+        if (localStream) {
+          requestAnimationFrame(checkSpeaking);
+        }
+      };
+      
+      checkSpeaking();
+    } catch (error) {
+      console.error('Error setting up speaking detection:', error);
+    }
+  };
+
+  // FIXED: Add missing produceMedia function
+  const produceMedia = async () => {
+    if (!localStream || !sendTransportRef.current) return;
+    
+    try {
+      const audioTrack = localStream.getAudioTracks()[0];
+      if (audioTrack) {
+        const audioProducer = await sendTransportRef.current.produce({
+          track: audioTrack,
+          codecOptions: {
+            opusStereo: true,
+            opusDtx: true,
+          },
+        });
+        
+        producersRef.current.audio = audioProducer;
+        
+        audioProducer.on('transportclose', () => {
+          console.log('Audio producer transport closed');
+        });
+
+        audioProducer.on('trackended', () => {
+          console.log('Audio producer track ended');
+        });
+        
+        console.log('Audio producer created successfully');
+      }
+    } catch (error) {
+      console.error('Error producing audio:', error);
+      setCallError('Failed to share audio. Please try again.');
+    }
+  };
+
+  // Consume remote audio
+  const consumeMedia = async (userId, roomId) => {
+    if (!recvTransportRef.current) return;
+    
+    try {
+      const { producers } = await socketRequest('getProducers', { userId, roomId });
+      
+      if (producers.length === 0) {
+        console.log(`No producers found for user ${userId}`);
+        return;
+      }
+
+      const stream = new MediaStream();
+      
+      for (const producer of producers) {
+        if (producer.kind !== 'audio') continue;
+        
+        const consumer = await recvTransportRef.current.consume({
+          producerId: producer.id,
+          rtpCapabilities: deviceRef.current.rtpCapabilities,
+        });
+        
+        consumersRef.current[`${userId}-audio`] = consumer;
+        stream.addTrack(consumer.track);
+        
+        await socketRequest('resumeConsumer', { consumerId: consumer.id, roomId });
+        
+        consumer.on('transportclose', () => {
+          console.log(`Consumer transport closed for user ${userId}`);
+        });
+
+        consumer.on('producerclose', () => {
+          console.log(`Producer closed for user ${userId}`);
+          setRemoteStreams(prev => {
+            const newStreams = { ...prev };
+            delete newStreams[userId];
+            return newStreams;
+          });
+        });
+      }
+
+      setRemoteStreams(prev => ({
+        ...prev,
+        [userId]: stream,
+      }));
+
+      console.log(`Remote audio stream setup for user ${userId}`);
+    } catch (error) {
+      console.error(`Error consuming media for user ${userId}:`, error);
+    }
+  };
+
+  // Start or join call
+  const startOrJoinCall = async (roomId) => {
+    if (isInCall || isInitializing) return;
+    
+    setIsInitializing(true);
+    setCallError(null);
+    currentRoomRef.current = roomId;
+    
+    try {
+      console.log('Starting/joining call in room:', roomId);
+      
+      // Initialize media stream
+      const stream = await initializeMedia();
+      
+      // Initialize mediasoup device
+      await initializeDevice(roomId);
+      
+      // Create transports
+      await createTransports(roomId);
+      
+      // Produce local media
       await produceMedia();
       
+      // Notify server about joining call
       socket.emit('start-call', { roomId });
       
-      console.log('Joined call in room:', roomId);
+      setIsInCall(true);
+      toast.success('Joined audio call successfully!');
+      
+      console.log('Successfully joined audio call');
     } catch (error) {
-      console.error('Error starting call:', error);
-      setIsInCall(false);
+      console.error('Error starting/joining call:', error);
+      setCallError(error.message || 'Failed to join audio call');
+      toast.error('Failed to join audio call');
+      
+      // Cleanup on error
+      await leaveCall(roomId);
+    } finally {
+      setIsInitializing(false);
     }
   };
 
-  // Leave call with proper cleanup
-  const leaveCall = (roomId) => {
-    if (!isInCall) return;
-  
-    // Stop all local tracks
-    if (localStream) {
-      stopAllTracks(localStream);
-      setLocalStream(null);
-    }
-  
-    // Close all producers and consumers
-    Object.values(producersRef.current).forEach(producer => {
-      try {
-        producer.close();
-      } catch (error) {
-        console.error('Error closing producer:', error);
+  // Leave call
+  const leaveCall = async (roomId) => {
+    if (!isInCall && !isInitializing) return;
+    
+    try {
+      console.log('Leaving call in room:', roomId);
+      
+      // Stop local stream
+      if (localStream) {
+        localStream.getTracks().forEach(track => track.stop());
+        setLocalStream(null);
       }
-    });
-    
-    Object.values(consumersRef.current).forEach(consumer => {
-      try {
-        consumer.close();
-      } catch (error) {
-        console.error('Error closing consumer:', error);
+      
+      // Close producers
+      Object.values(producersRef.current).forEach(producer => {
+        try {
+          producer.close();
+        } catch (error) {
+          console.error('Error closing producer:', error);
+        }
+      });
+      producersRef.current = {};
+      
+      // Close consumers
+      Object.values(consumersRef.current).forEach(consumer => {
+        try {
+          consumer.close();
+        } catch (error) {
+          console.error('Error closing consumer:', error);
+        }
+      });
+      consumersRef.current = {};
+      
+      // Close transports
+      if (sendTransportRef.current) {
+        sendTransportRef.current.close();
+        sendTransportRef.current = null;
       }
-    });
-    
-    producersRef.current = {};
-    consumersRef.current = {};
-    
-    // Close transports
-    if (sendTransportRef.current) {
-      sendTransportRef.current.close();
-      sendTransportRef.current = null;
-    }
-    
-    if (recvTransportRef.current) {
-      recvTransportRef.current.close();
-      recvTransportRef.current = null;
-    }
-    
-    // Clean up remote streams
-    Object.values(remoteStreams).forEach(stream => {
-      stopAllTracks(stream);
-    });
-    setRemoteStreams({});
-    
-    setCallParticipants([]);
-    setIsInCall(false);
-    setMicEnabled(true);
-    setVideoEnabled(true);
-  
-    if (socket && connected) {
-      socket.emit('leave-call', { roomId });
+      
+      if (recvTransportRef.current) {
+        recvTransportRef.current.close();
+        recvTransportRef.current = null;
+      }
+      
+      // Clear remote streams
+      setRemoteStreams({});
+      setCallParticipants([]);
+      setIsInCall(false);
+      setMicEnabled(true);
+      setIsSpeaking(false);
+      setSpeakingUsers({});
+      setCallError(null);
+      currentRoomRef.current = null;
+      
+      // Notify server
+      if (socket) {
+        socket.emit('leave-call', { roomId });
+      }
+      
+      toast.success('Left audio call');
+      console.log('Successfully left audio call');
+    } catch (error) {
+      console.error('Error leaving call:', error);
     }
   };
 
   // Toggle microphone
   const toggleMic = () => {
-    if (!localStream || !socket || !connected) return;
+    if (!localStream) return;
     
     const newMicState = !micEnabled;
     localStream.getAudioTracks().forEach(track => {
       track.enabled = newMicState;
     });
+    
     setMicEnabled(newMicState);
     
-    const roomId = Array.from(socket.rooms || new Set()).find(room => room !== socket.id);
-    if (roomId && socket) {
-      socket.emit('toggle-mic', { 
-        userId: socket.id, 
+    if (socket && currentRoomRef.current) {
+      socket.emit('toggle-mic', {
+        userId: socket.id,
         micEnabled: newMicState,
-        roomId
+        roomId: currentRoomRef.current,
       });
-    }
-  };
-
-  // Toggle video
-  const toggleVideo = async () => {
-    if (!localStream || !socket || !connected) return;
-
-    const newVideoState = !videoEnabled;
-    const roomId = Array.from(socket.rooms || new Set()).find(room => room !== socket.id);
-    if (!roomId) return;
-
-    if (newVideoState) {
-      // Turning video ON
-      try {
-        const newStream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: true,
-        });
-        
-        // Stop old video tracks
-        localStream.getVideoTracks().forEach(track => track.stop());
-        
-        // Get new tracks
-        const newVideoTrack = newStream.getVideoTracks()[0];
-        const currentAudioTrack = localStream.getAudioTracks()[0];
-        
-        // Create new stream
-        const updatedStream = new MediaStream([currentAudioTrack, newVideoTrack]);
-        setLocalStream(updatedStream);
-        
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = updatedStream;
-        }
-        
-        // Replace video producer
-        if (producersRef.current.video) {
-          producersRef.current.video.close();
-          delete producersRef.current.video;
-        }
-        
-        if (sendTransportRef.current) {
-          const videoProducer = await sendTransportRef.current.produce({
-            track: newVideoTrack,
-            encodings: [
-              { maxBitrate: 1000000 },
-              { maxBitrate: 500000 },
-              { maxBitrate: 250000 }
-            ],
-            codecOptions: {
-              videoGoogleStartBitrate: 1000
-            }
-          });
-          producersRef.current.video = videoProducer;
-        }
-        
-        // Clean up
-        newStream.getAudioTracks().forEach(track => track.stop());
-        
-        setVideoEnabled(true);
-      } catch (error) {
-        console.error('Error enabling video:', error);
-        return;
-      }
-    } else {
-      // Turning video OFF
-      localStream.getVideoTracks().forEach(track => track.stop());
-      
-      const audioOnlyStream = new MediaStream(localStream.getAudioTracks());
-      setLocalStream(audioOnlyStream);
-      
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = audioOnlyStream;
-      }
-      
-      // Close video producer
-      if (producersRef.current.video) {
-        producersRef.current.video.close();
-        delete producersRef.current.video;
-      }
-      
-      setVideoEnabled(false);
     }
     
-    if (socket && roomId) {
-      socket.emit('toggle-video', { 
-        userId: socket.id, 
-        videoEnabled: newVideoState,
-        roomId
-      });
-    }
+    toast.success(newMicState ? 'Microphone enabled' : 'Microphone muted');
   };
 
-  // Handle socket events
+  // Pagination controls
+  const nextPage = () => {
+    const totalPages = Math.ceil((callParticipants.length + 1) / PAGE_SIZE);
+    setCurrentPage(prev => Math.min(prev + 1, totalPages - 1));
+  };
+
+  const prevPage = () => {
+    setCurrentPage(prev => Math.max(prev - 1, 0));
+  };
+
+  // Socket event handlers
   useEffect(() => {
     if (!socket || !connected) return;
 
-    const handleCallStarted = ({ participants, roomId }) => {
+    const handleCallStarted = async ({ participants, roomId }) => {
       console.log('Call started with participants:', participants);
       const otherParticipants = participants.filter(p => p.id !== socket.id);
       setCallParticipants(otherParticipants);
       
       // Consume media from existing participants
-      otherParticipants.forEach(async (participant) => {
-        await consumeMedia(participant.id);
-      });
+      for (const participant of otherParticipants) {
+        await consumeMedia(participant.id, roomId);
+      }
     };
 
-    const handleUserJoined = ({ userId, username }) => {
+    const handleUserJoinedCall = async ({ userId, username, micEnabled }) => {
       console.log('User joined call:', username);
-      
       setCallParticipants(prev => {
         const exists = prev.some(p => p.id === userId);
         if (!exists) {
-          return [...prev, { id: userId, username, micEnabled: true, videoEnabled: true }];
+          return [...prev, { id: userId, username, micEnabled, isSpeaking: false }];
         }
         return prev;
       });
       
-      if (userId !== socket.id) {
-        consumeMedia(userId);
+      if (userId !== socket.id && currentRoomRef.current) {
+        await consumeMedia(userId, currentRoomRef.current);
       }
     };
 
-    const handleUserLeft = ({ userId }) => {
+    const handleUserLeftCall = ({ userId }) => {
       console.log('User left call:', userId);
-      
       setCallParticipants(prev => prev.filter(p => p.id !== userId));
       
-      // Close consumers for this user
-      Object.keys(consumersRef.current)
-        .filter(key => key.startsWith(`${userId}-`))
-        .forEach(key => {
-          consumersRef.current[key].close();
-          delete consumersRef.current[key];
-        });
+      // Clean up consumer
+      const consumerKey = `${userId}-audio`;
+      if (consumersRef.current[consumerKey]) {
+        consumersRef.current[consumerKey].close();
+        delete consumersRef.current[consumerKey];
+      }
       
+      // Remove remote stream
       setRemoteStreams(prev => {
         const newStreams = { ...prev };
         delete newStreams[userId];
         return newStreams;
+      });
+      
+      setSpeakingUsers(prev => {
+        const newSpeaking = { ...prev };
+        delete newSpeaking[userId];
+        return newSpeaking;
       });
     };
 
@@ -471,88 +504,51 @@ export const CallProvider = ({ children }) => {
       );
     };
 
-    const handleToggleVideo = ({ userId, videoEnabled }) => {
-      setCallParticipants(prev =>
-        prev.map(p => p.id === userId ? { ...p, videoEnabled } : p)
-      );
+    const handleSpeakingStatus = ({ userId, isSpeaking }) => {
+      setSpeakingUsers(prev => ({ ...prev, [userId]: isSpeaking }));
+    };
+
+    const handleNewProducer = async ({ userId }) => {
+      if (userId !== socket.id && currentRoomRef.current) {
+        await consumeMedia(userId, currentRoomRef.current);
+      }
     };
 
     const handleCallEnded = () => {
       console.log('Call ended by server');
-      leaveCall();
+      if (currentRoomRef.current) {
+        leaveCall(currentRoomRef.current);
+      }
     };
 
+    // Register event listeners
     socket.on('call-started', handleCallStarted);
-    socket.on('user-joined-call', handleUserJoined);
-    socket.on('user-left-call', handleUserLeft);
+    socket.on('user-joined-call', handleUserJoinedCall);
+    socket.on('user-left-call', handleUserLeftCall);
     socket.on('toggle-mic', handleToggleMic);
-    socket.on('toggle-video', handleToggleVideo);
+    socket.on('speaking-status', handleSpeakingStatus);
+    socket.on('new-producer', handleNewProducer);
     socket.on('call-ended', handleCallEnded);
-    socket.on('new-producer', ({ userId }) => {
-      if (userId !== socket.id) {
-        consumeMedia(userId);
-      }
-    });
 
     return () => {
       socket.off('call-started', handleCallStarted);
-      socket.off('user-joined-call', handleUserJoined);
-      socket.off('user-left-call', handleUserLeft);
+      socket.off('user-joined-call', handleUserJoinedCall);
+      socket.off('user-left-call', handleUserLeftCall);
       socket.off('toggle-mic', handleToggleMic);
-      socket.off('toggle-video', handleToggleVideo);
+      socket.off('speaking-status', handleSpeakingStatus);
+      socket.off('new-producer', handleNewProducer);
       socket.off('call-ended', handleCallEnded);
-      socket.off('new-producer');
     };
-  }, [socket, connected, localStream]);
+  }, [socket, connected]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (localStream) {
-        stopAllTracks(localStream);
+      if (currentRoomRef.current) {
+        leaveCall(currentRoomRef.current);
       }
-      
-      // Close all producers and consumers
-      Object.values(producersRef.current).forEach(producer => {
-        try {
-          producer.close();
-        } catch (error) {
-          console.error('Error closing producer:', error);
-        }
-      });
-      
-      Object.values(consumersRef.current).forEach(consumer => {
-        try {
-          consumer.close();
-        } catch (error) {
-          console.error('Error closing consumer:', error);
-        }
-      });
-      
-      // Close transports
-      if (sendTransportRef.current) {
-        sendTransportRef.current.close();
-      }
-      
-      if (recvTransportRef.current) {
-        recvTransportRef.current.close();
-      }
-      
-      // Clean up remote streams
-      Object.values(remoteStreams).forEach(stream => {
-        stopAllTracks(stream);
-      });
     };
   }, []);
-
-  // Pagination functions
-  const nextPage = () => {
-    setCurrentPage(prev => Math.min(prev + 1, Math.ceil(callParticipants.length / PAGE_SIZE) - 1));
-  };
-
-  const prevPage = () => {
-    setCurrentPage(prev => Math.max(prev - 1, 0));
-  };
 
   const value = {
     localStream,
@@ -560,14 +556,15 @@ export const CallProvider = ({ children }) => {
     callParticipants,
     isInCall,
     micEnabled,
-    videoEnabled,
-    localVideoRef,
+    isSpeaking,
+    speakingUsers,
+    callError,
+    isInitializing,
     currentPage,
     PAGE_SIZE,
     startOrJoinCall,
     leaveCall,
     toggleMic,
-    toggleVideo,
     nextPage,
     prevPage,
   };

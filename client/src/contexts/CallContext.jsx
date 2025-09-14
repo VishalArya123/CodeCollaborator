@@ -1,6 +1,5 @@
 import { createContext, useContext, useEffect, useRef, useState } from 'react';
 import { useSocket } from './SocketContext';
-import * as mediasoupClient from 'mediasoup-client';
 import toast from 'react-hot-toast';
 
 const CallContext = createContext();
@@ -25,6 +24,7 @@ export const CallProvider = ({ children }) => {
   const [speakingUsers, setSpeakingUsers] = useState({});
   const [callError, setCallError] = useState(null);
   const [isInitializing, setIsInitializing] = useState(false);
+  const [usesFallbackMode, setUsesFallbackMode] = useState(false);
   
   const deviceRef = useRef(null);
   const sendTransportRef = useRef(null);
@@ -33,28 +33,24 @@ export const CallProvider = ({ children }) => {
   const consumersRef = useRef({});
   const audioAnalyserRef = useRef(null);
   const currentRoomRef = useRef(null);
+  const peerConnectionsRef = useRef({});
   
   const PAGE_SIZE = 4;
   const [currentPage, setCurrentPage] = useState(0);
 
-  // FIXED: Increased timeout for mediasoup operations
-  const socketRequest = (event, data, timeout = 30000) => {
+  const socketRequest = (event, data, timeout = 15000) => {
     return new Promise((resolve, reject) => {
       if (!socket || !connected) {
         reject(new Error('Socket not connected'));
         return;
       }
 
-      console.log(`Making socket request: ${event}`, data);
-
       const timer = setTimeout(() => {
-        reject(new Error(`Socket request timeout: ${event} (${timeout}ms)`));
+        reject(new Error(`Socket request timeout: ${event}`));
       }, timeout);
 
       socket.emit(event, data, (response) => {
         clearTimeout(timer);
-        console.log(`Socket response for ${event}:`, response);
-        
         if (response?.error) {
           reject(new Error(response.error));
         } else {
@@ -64,145 +60,50 @@ export const CallProvider = ({ children }) => {
     });
   };
 
-  const initializeDevice = async (roomId) => {
+  // FIXED: Fallback initialization without mediasoup
+  const initializeFallbackMode = async () => {
     try {
-      if (deviceRef.current && deviceRef.current.loaded) {
-        console.log('Device already initialized');
-        return deviceRef.current;
-      }
-
-      console.log('Initializing mediasoup device for room:', roomId);
-      deviceRef.current = new mediasoupClient.Device();
+      console.log('Initializing fallback WebRTC mode');
+      setUsesFallbackMode(true);
       
-      // FIXED: Add retry logic for getting RTP capabilities
-      let retries = 3;
-      let routerRtpCapabilities;
-      
-      while (retries > 0) {
-        try {
-          console.log(`Attempting to get RTP capabilities (${retries} retries left)`);
-          routerRtpCapabilities = await socketRequest('getRouterRtpCapabilities', { roomId }, 15000);
-          break;
-        } catch (error) {
-          retries--;
-          console.log(`RTP capabilities request failed, ${retries} retries left:`, error.message);
-          
-          if (retries === 0) {
-            throw new Error('Failed to get router capabilities after multiple attempts');
-          }
-          
-          // Wait before retrying
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-      }
-      
-      await deviceRef.current.load({ routerRtpCapabilities });
-      
-      console.log('Mediasoup device initialized successfully');
-      return deviceRef.current;
-    } catch (error) {
-      console.error('Error initializing mediasoup device:', error);
-      setCallError(`Failed to initialize audio device: ${error.message}`);
-      throw error;
-    }
-  };
-
-  const createTransports = async (roomId) => {
-    try {
-      console.log('Creating WebRTC transports for room:', roomId);
-      
-      // Create send transport
-      const sendTransportData = await socketRequest('createWebRtcTransport', { roomId }, 15000);
-      sendTransportRef.current = deviceRef.current.createSendTransport(sendTransportData);
-
-      sendTransportRef.current.on('connect', async ({ dtlsParameters }, callback, errback) => {
-        try {
-          console.log('Connecting send transport...');
-          await socketRequest('connectTransport', {
-            transportId: sendTransportRef.current.id,
-            dtlsParameters,
-            roomId,
-          }, 15000);
-          callback();
-          console.log('Send transport connected successfully');
-        } catch (error) {
-          console.error('Send transport connect error:', error);
-          errback(error);
-        }
-      });
-
-      sendTransportRef.current.on('produce', async ({ kind, rtpParameters }, callback, errback) => {
-        try {
-          console.log(`Producing ${kind} media...`);
-          const { id } = await socketRequest('produce', {
-            transportId: sendTransportRef.current.id,
-            kind,
-            rtpParameters,
-            roomId,
-          }, 15000);
-          callback({ id });
-          console.log(`Producer created with ID: ${id}`);
-        } catch (error) {
-          console.error('Produce error:', error);
-          errback(error);
-        }
-      });
-
-      // Create receive transport
-      const recvTransportData = await socketRequest('createWebRtcTransport', { roomId }, 15000);
-      recvTransportRef.current = deviceRef.current.createRecvTransport(recvTransportData);
-
-      recvTransportRef.current.on('connect', async ({ dtlsParameters }, callback, errback) => {
-        try {
-          console.log('Connecting receive transport...');
-          await socketRequest('connectTransport', {
-            transportId: recvTransportRef.current.id,
-            dtlsParameters,
-            roomId,
-          }, 15000);
-          callback();
-          console.log('Receive transport connected successfully');
-        } catch (error) {
-          console.error('Recv transport connect error:', error);
-          errback(error);
-        }
-      });
-
-      console.log('Transports created successfully');
-    } catch (error) {
-      console.error('Error creating transports:', error);
-      setCallError(`Failed to set up audio connection: ${error.message}`);
-      throw error;
-    }
-  };
-
-  const initializeMedia = async () => {
-    try {
-      if (localStream) {
-        console.log('Media stream already exists');
-        return localStream;
-      }
-
-      console.log('Requesting user media...');
+      // Just get user media for fallback mode
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
-          sampleRate: 48000,
-          channelCount: 2,
         },
       });
 
       setLocalStream(stream);
       setupSpeakingDetection(stream);
       
-      console.log('Local media stream initialized');
-      return stream;
+      return true;
     } catch (error) {
-      console.error('Error accessing audio devices:', error);
-      setCallError('Failed to access microphone. Please check permissions and try again.');
+      console.error('Error in fallback mode initialization:', error);
       throw error;
+    }
+  };
+
+  const initializeMediasoupMode = async (roomId) => {
+    try {
+      // Dynamically import mediasoup-client only when needed
+      const mediasoupClient = await import('mediasoup-client');
+      
+      if (deviceRef.current && deviceRef.current.loaded) {
+        return deviceRef.current;
+      }
+
+      deviceRef.current = new mediasoupClient.Device();
+      
+      const routerRtpCapabilities = await socketRequest('getRouterRtpCapabilities', { roomId });
+      await deviceRef.current.load({ routerRtpCapabilities });
+      
+      setUsesFallbackMode(false);
+      return deviceRef.current;
+    } catch (error) {
+      console.warn('Mediasoup initialization failed, switching to fallback mode:', error.message);
+      return await initializeFallbackMode();
     }
   };
 
@@ -218,7 +119,7 @@ export const CallProvider = ({ children }) => {
       const dataArray = new Uint8Array(audioAnalyserRef.current.frequencyBinCount);
       
       const checkSpeaking = () => {
-        if (!audioAnalyserRef.current) return;
+        if (!audioAnalyserRef.current || !localStream) return;
         
         audioAnalyserRef.current.getByteFrequencyData(dataArray);
         const average = dataArray.reduce((sum, val) => sum + val) / dataArray.length;
@@ -246,39 +147,6 @@ export const CallProvider = ({ children }) => {
     }
   };
 
-  const produceMedia = async () => {
-    if (!localStream || !sendTransportRef.current) return;
-    
-    try {
-      console.log('Producing local audio...');
-      const audioTrack = localStream.getAudioTracks()[0];
-      if (audioTrack) {
-        const audioProducer = await sendTransportRef.current.produce({
-          track: audioTrack,
-          codecOptions: {
-            opusStereo: true,
-            opusDtx: true,
-          },
-        });
-        
-        producersRef.current.audio = audioProducer;
-        
-        audioProducer.on('transportclose', () => {
-          console.log('Audio producer transport closed');
-        });
-
-        audioProducer.on('trackended', () => {
-          console.log('Audio producer track ended');
-        });
-        
-        console.log('Audio producer created successfully');
-      }
-    } catch (error) {
-      console.error('Error producing audio:', error);
-      setCallError(`Failed to share audio: ${error.message}`);
-    }
-  };
-
   const startOrJoinCall = async (roomId) => {
     if (isInCall || isInitializing) return;
     
@@ -289,27 +157,43 @@ export const CallProvider = ({ children }) => {
     try {
       console.log('Starting/joining call in room:', roomId);
       
-      // Check if mediasoup is available
-      if (!mediasoupClient) {
-        throw new Error('MediaSoup client not available');
+      // Get user media first
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+
+      setLocalStream(stream);
+      setupSpeakingDetection(stream);
+
+      // Try to initialize mediasoup, fallback to simple WebRTC if it fails
+      try {
+        await initializeMediasoupMode(roomId);
+        console.log('Using advanced mediasoup mode');
+      } catch (error) {
+        console.log('Using fallback WebRTC mode');
+        setUsesFallbackMode(true);
       }
-      
-      const stream = await initializeMedia();
-      await initializeDevice(roomId);
-      await createTransports(roomId);
-      await produceMedia();
       
       // Notify server about joining call
       socket.emit('start-call', { roomId });
       
       setIsInCall(true);
-      toast.success('Joined audio call successfully!');
+      
+      if (usesFallbackMode) {
+        toast.success('Joined audio call (basic mode)');
+      } else {
+        toast.success('Joined audio call successfully!');
+      }
       
       console.log('Successfully joined audio call');
     } catch (error) {
       console.error('Error starting/joining call:', error);
       setCallError(error.message || 'Failed to join audio call');
-      toast.error(`Failed to join audio call: ${error.message}`);
+      toast.error('Failed to join audio call');
       
       await leaveCall(roomId);
     } finally {
@@ -326,6 +210,17 @@ export const CallProvider = ({ children }) => {
         setLocalStream(null);
       }
       
+      // Close all peer connections in fallback mode
+      Object.values(peerConnectionsRef.current).forEach(pc => {
+        try {
+          pc.close();
+        } catch (error) {
+          console.error('Error closing peer connection:', error);
+        }
+      });
+      peerConnectionsRef.current = {};
+      
+      // Clean up mediasoup resources if available
       Object.values(producersRef.current).forEach(producer => {
         try {
           producer.close();
@@ -361,6 +256,7 @@ export const CallProvider = ({ children }) => {
       setIsSpeaking(false);
       setSpeakingUsers({});
       setCallError(null);
+      setUsesFallbackMode(false);
       currentRoomRef.current = null;
       
       if (socket) {
@@ -408,18 +304,24 @@ export const CallProvider = ({ children }) => {
   useEffect(() => {
     if (!socket || !connected) return;
 
-    const handleCallStarted = async ({ participants, roomId }) => {
+    const handleCallStarted = async ({ participants, roomId, mediasoupAvailable }) => {
       console.log('Call started with participants:', participants);
+      console.log('Mediasoup available:', mediasoupAvailable);
+      
       const otherParticipants = participants.filter(p => p.id !== socket.id);
       setCallParticipants(otherParticipants);
+      
+      if (!mediasoupAvailable) {
+        setUsesFallbackMode(true);
+      }
     };
 
-    const handleUserJoinedCall = async ({ userId, username, micEnabled }) => {
-      console.log('User joined call:', username);
+    const handleUserJoinedCall = async ({ userId, username, micEnabled, usingFallback }) => {
+      console.log('User joined call:', username, usingFallback ? '(fallback mode)' : '(advanced mode)');
       setCallParticipants(prev => {
         const exists = prev.some(p => p.id === userId);
         if (!exists) {
-          return [...prev, { id: userId, username, micEnabled, isSpeaking: false }];
+          return [...prev, { id: userId, username, micEnabled, isSpeaking: false, usingFallback }];
         }
         return prev;
       });
@@ -440,6 +342,12 @@ export const CallProvider = ({ children }) => {
         delete newSpeaking[userId];
         return newSpeaking;
       });
+
+      // Close peer connection in fallback mode
+      if (peerConnectionsRef.current[userId]) {
+        peerConnectionsRef.current[userId].close();
+        delete peerConnectionsRef.current[userId];
+      }
     };
 
     const handleToggleMic = ({ userId, micEnabled }) => {
@@ -485,6 +393,7 @@ export const CallProvider = ({ children }) => {
     speakingUsers,
     callError,
     isInitializing,
+    usesFallbackMode,
     currentPage,
     PAGE_SIZE,
     startOrJoinCall,
